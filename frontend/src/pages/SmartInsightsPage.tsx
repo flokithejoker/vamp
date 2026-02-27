@@ -1,94 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
-import { StatCard } from '../components/StatCard';
+import { useEffect, useState } from 'react';
 import { fetchJsonWithRetry } from '../lib/http';
 
 type TimelineKey = '1d' | '7d' | '1m';
-type ConfidenceLevel = 'low' | 'medium' | 'high';
 type OperationalStatus = 'stable' | 'watch' | 'at_risk';
-type CriterionIssue = 'human_escalation' | 'intent_identification' | 'call_cancellation' | 'none';
-type LinkedCriterion = CriterionIssue;
-
-type SmartInsightsReportResponse = {
-  meta: {
-    timeline: TimelineKey;
-    generatedAtIso: string;
-    totalCalls: number;
-    dataCoveragePercent: number;
-  };
-  overview: {
-    summary: string;
-    operationalStatus: OperationalStatus;
-    topOpportunity: string;
-  };
-  kpis: {
-    resolutionRatePercent: number;
-    unresolvedCalls: number;
-    criteriaHealthScore: number;
-    topIntent: {
-      value: string;
-      calls: number;
-      sharePercent: number;
-    };
-    topFrictionPoint: {
-      value: string;
-      calls: number;
-      sharePercent: number;
-    };
-  };
-  criteria: {
-    weights: {
-      humanEscalation: 0.5;
-      intentIdentification: 0.3;
-      callCancellation: 0.2;
-    };
-    passRates: {
-      humanEscalation: number;
-      intentIdentification: number;
-      callCancellation: number;
-    };
-    unknownRates: {
-      humanEscalation: number;
-      intentIdentification: number;
-      callCancellation: number;
-    };
-    keyCriterionIssue: CriterionIssue;
-  };
-  hotspots: Array<{
-    segmentType: 'hotel_location' | 'user_intent' | 'booking_stage' | 'topics';
-    segmentValue: string;
-    calls: number;
-    unresolvedRatePercent: number;
-    weightedCriteriaFailRatePercent: number;
-    primaryFrictionPoint: string;
-    knowledgeGapTopic: string;
-    confidence: ConfidenceLevel;
-  }>;
-  actionQueue: Array<{
-    priority: 1 | 2 | 3 | 4 | 5;
-    recommendedInternalAction: string;
-    targetSegment: string;
-    linkedCriterion: LinkedCriterion;
-    why: string;
-    expectedImpact: 'low' | 'medium' | 'high';
-    evidence: {
-      calls: number;
-      sharePercent: number;
-    };
-  }>;
-  dataQuality: {
-    missingFieldRates: Array<{
-      field: string;
-      missingPercent: number;
-    }>;
-    caveats: string[];
-  };
-};
-
-type DrilldownContext = {
-  source: 'actionQueue' | 'hotspots';
-  segmentType: string;
-  segmentValue: string;
-};
 
 const DEFAULT_TIMELINE: TimelineKey = '7d';
 const TIMELINE_OPTIONS: Array<{ key: TimelineKey; label: string }> = [
@@ -96,7 +10,59 @@ const TIMELINE_OPTIONS: Array<{ key: TimelineKey; label: string }> = [
   { key: '7d', label: '7d' },
   { key: '1m', label: '1m' },
 ];
-const DRILLDOWN_STORAGE_KEY = 'smartInsightsDrilldownContext';
+
+type SmartInsightsReportResponse = {
+  meta: {
+    reportVersion: 2;
+    timeline: TimelineKey;
+    generatedAtIso: string;
+    totalCalls: number;
+    availableCalls: number;
+    analyzedCalls: number;
+    detailFetchCap: number;
+    cappedByDetailCap: boolean;
+    detailFetchFailures: number;
+    dataCoveragePercent: number;
+  };
+  overview: {
+    summary: string;
+    operationalStatus: OperationalStatus;
+    topOpportunity: string;
+  };
+  knowledgeGapInsights: Array<{
+    knowledgeGapLabel: string;
+    primaryFrictionPointLabel: string;
+    recommendedInternalActionLabel: string;
+    conciseExplanation: string;
+    evidence: {
+      calls: number;
+      sharePercent: number;
+    };
+  }>;
+  failureTypeInsights: Array<{
+    failureTypeLabel: string;
+    whyItHappens: string;
+    evidence: {
+      calls: number;
+      sharePercent: number;
+    };
+    relatedFriction: string;
+    relatedKnowledgeGap: string;
+  }>;
+  priorityActionQueue: Array<{
+    priority: number;
+    actionTitle: string;
+    whyNow: string;
+    agentNextStep: string;
+    escalationTrigger: string;
+    appliesTo: string;
+    evidence: {
+      calls: number;
+      sharePercent: number;
+    };
+  }>;
+  caveats: string[];
+};
 
 function formatInteger(value: number): string {
   return new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(value);
@@ -117,79 +83,14 @@ function formatDateTime(iso: string): string {
   }).format(parsed);
 }
 
-function formatToken(value: string): string {
-  if (!value || value === 'unknown') {
-    return 'Unknown';
+function formatStatus(value: OperationalStatus): string {
+  if (value === 'at_risk') {
+    return 'At Risk';
   }
-  return value
-    .split('_')
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(' ');
-}
-
-function formatSegmentType(value: string): string {
-  if (value === 'hotel_location') {
-    return 'Hotel';
+  if (value === 'watch') {
+    return 'Watch';
   }
-  if (value === 'user_intent') {
-    return 'Intent';
-  }
-  if (value === 'booking_stage') {
-    return 'Booking Stage';
-  }
-  if (value === 'topics') {
-    return 'Topic';
-  }
-  return formatToken(value);
-}
-
-function formatCriterionLabel(value: LinkedCriterion): string {
-  if (value === 'none') {
-    return 'None';
-  }
-  return formatToken(value);
-}
-
-function formatTopMetric(metric: { value: string; calls: number; sharePercent: number }): string {
-  if (metric.calls <= 0) {
-    return 'No signal';
-  }
-  return formatToken(metric.value);
-}
-
-function parseDrilldownContext(raw: string | null): DrilldownContext | null {
-  if (!raw) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(raw) as DrilldownContext;
-    if (!parsed || typeof parsed !== 'object') {
-      return null;
-    }
-    if (parsed.source !== 'actionQueue' && parsed.source !== 'hotspots') {
-      return null;
-    }
-    if (typeof parsed.segmentType !== 'string' || typeof parsed.segmentValue !== 'string') {
-      return null;
-    }
-    return parsed;
-  } catch {
-    return null;
-  }
-}
-
-function barBreakdown(passRate: number, unknownRate: number): { pass: number; fail: number; unknown: number } {
-  const normalizedUnknown = Math.max(0, Math.min(100, unknownRate));
-  const knownShare = 100 - normalizedUnknown;
-  const normalizedPass = Math.max(0, Math.min(100, passRate));
-  const passShare = (normalizedPass / 100) * knownShare;
-  const failShare = Math.max(0, knownShare - passShare);
-  return {
-    pass: Number(passShare.toFixed(1)),
-    fail: Number(failShare.toFixed(1)),
-    unknown: Number(normalizedUnknown.toFixed(1)),
-  };
+  return 'Stable';
 }
 
 export function SmartInsightsPage() {
@@ -198,9 +99,6 @@ export function SmartInsightsPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reloadTick, setReloadTick] = useState(0);
-  const [drilldownContext, setDrilldownContext] = useState<DrilldownContext | null>(() =>
-    parseDrilldownContext(window.sessionStorage.getItem(DRILLDOWN_STORAGE_KEY))
-  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -241,25 +139,8 @@ export function SmartInsightsPage() {
     };
   }, [selectedTimeline, reloadTick]);
 
-  const hotspots = useMemo(() => {
-    if (!data) {
-      return [];
-    }
-    return [...data.hotspots].sort(
-      (left, right) =>
-        right.weightedCriteriaFailRatePercent - left.weightedCriteriaFailRatePercent ||
-        right.unresolvedRatePercent - left.unresolvedRatePercent ||
-        right.calls - left.calls
-    );
-  }, [data]);
-
   function refreshReport() {
     setReloadTick((previous) => previous + 1);
-  }
-
-  function storeDrilldownContext(context: DrilldownContext) {
-    setDrilldownContext(context);
-    window.sessionStorage.setItem(DRILLDOWN_STORAGE_KEY, JSON.stringify(context));
   }
 
   return (
@@ -270,7 +151,9 @@ export function SmartInsightsPage() {
             <h2>Smart Insights</h2>
             {data ? (
               <p className="smart-generated-at">
-                Generated {formatDateTime(data.meta.generatedAtIso)} • {formatInteger(data.meta.totalCalls)} calls
+                Generated {formatDateTime(data.meta.generatedAtIso)} • Analyzed {formatInteger(data.meta.analyzedCalls)} of{' '}
+                {formatInteger(data.meta.availableCalls)} calls
+                {data.meta.cappedByDetailCap ? ` (cap ${formatInteger(data.meta.detailFetchCap)})` : ''}
               </p>
             ) : null}
           </div>
@@ -301,228 +184,132 @@ export function SmartInsightsPage() {
       ) : null}
 
       {!isLoading && !error && data ? (
-        <>
-          <div className="page-surface smart-briefing-surface">
-            <div className="smart-briefing-head">
-              <h3>Shift Briefing</h3>
+        <article className="page-surface smart-report-sheet">
+          <section className="smart-report-section">
+            <div className="smart-report-section-head">
+              <h3>Executive Summary</h3>
               <span className={`smart-status-chip smart-status-${data.overview.operationalStatus}`}>
-                {formatToken(data.overview.operationalStatus)}
+                {formatStatus(data.overview.operationalStatus)}
               </span>
             </div>
-            <p className="smart-briefing-summary">{data.overview.summary}</p>
-            <p className="smart-briefing-opportunity">
+            <p className="smart-report-summary">{data.overview.summary}</p>
+            <p className="smart-report-opportunity">
               <strong>Top opportunity:</strong> {data.overview.topOpportunity}
             </p>
-          </div>
+          </section>
 
-          <div className="smart-kpi-grid">
-            <StatCard
-              title="Resolution Rate"
-              value={formatPercent(data.kpis.resolutionRatePercent)}
-              description="Resolved + partially resolved over known outcomes."
-            />
-            <StatCard
-              title="Unresolved Calls"
-              value={formatInteger(data.kpis.unresolvedCalls)}
-              description="Calls still unresolved or escalated."
-            />
-            <StatCard
-              title="Criteria Health"
-              value={formatPercent(data.kpis.criteriaHealthScore)}
-              description="Weighted score from escalation, intent, and cancellation criteria."
-            />
-            <StatCard
-              title="Top Intent"
-              value={formatTopMetric(data.kpis.topIntent)}
-              description={`${formatInteger(data.kpis.topIntent.calls)} calls · ${formatPercent(
-                data.kpis.topIntent.sharePercent
-              )}`}
-            />
-            <StatCard
-              title="Top Friction"
-              value={formatTopMetric(data.kpis.topFrictionPoint)}
-              description={`${formatInteger(data.kpis.topFrictionPoint.calls)} calls · ${formatPercent(
-                data.kpis.topFrictionPoint.sharePercent
-              )}`}
-            />
-          </div>
-
-          <div className="page-surface smart-criteria-surface">
-            <div className="smart-section-header">
-              <h3>Criteria Scoreboard</h3>
-              <p>Weighted impact: escalation 0.5, intent 0.3, cancellation 0.2</p>
+          <section className="smart-report-section">
+            <div className="smart-report-section-head">
+              <h3>Main Knowledge Gaps</h3>
+              <p>Most frequent patterns from recent calls.</p>
             </div>
 
-            <div className="smart-criteria-grid">
-              {[
-                {
-                  key: 'humanEscalation',
-                  label: 'Human Escalation',
-                  weight: data.criteria.weights.humanEscalation,
-                  passRate: data.criteria.passRates.humanEscalation,
-                  unknownRate: data.criteria.unknownRates.humanEscalation,
-                },
-                {
-                  key: 'intentIdentification',
-                  label: 'Intent Identification',
-                  weight: data.criteria.weights.intentIdentification,
-                  passRate: data.criteria.passRates.intentIdentification,
-                  unknownRate: data.criteria.unknownRates.intentIdentification,
-                },
-                {
-                  key: 'callCancellation',
-                  label: 'Call Cancellation',
-                  weight: data.criteria.weights.callCancellation,
-                  passRate: data.criteria.passRates.callCancellation,
-                  unknownRate: data.criteria.unknownRates.callCancellation,
-                },
-              ].map((criterion) => {
-                const breakdown = barBreakdown(criterion.passRate, criterion.unknownRate);
-                return (
-                  <article key={criterion.key} className="smart-criterion-card">
-                    <div className="smart-criterion-head">
-                      <h4>{criterion.label}</h4>
-                      <span className="smart-weight-badge">w={criterion.weight}</span>
-                    </div>
-                    <div className="smart-criterion-bar" aria-hidden="true">
-                      <span className="smart-criterion-pass" style={{ width: `${breakdown.pass}%` }} />
-                      <span className="smart-criterion-fail" style={{ width: `${breakdown.fail}%` }} />
-                      <span className="smart-criterion-unknown" style={{ width: `${breakdown.unknown}%` }} />
-                    </div>
-                    <p className="smart-criterion-meta">
-                      Pass {formatPercent(criterion.passRate)} · Unknown {formatPercent(criterion.unknownRate)}
-                    </p>
-                  </article>
-                );
-              })}
-            </div>
-          </div>
-
-          <div className="page-surface smart-actions-surface">
-            <div className="smart-section-header">
-              <h3>Priority Action Queue</h3>
-              <p>Ranked by impact x frequency from the selected timeline.</p>
-            </div>
-            <ol className="smart-action-list">
-              {data.actionQueue.map((action) => (
-                <li key={`${action.priority}-${action.recommendedInternalAction}`}>
-                  <button
-                    type="button"
-                    className="smart-action-item"
-                    onClick={() =>
-                      storeDrilldownContext({
-                        source: 'actionQueue',
-                        segmentType: action.targetSegment.split(':')[0] || 'general',
-                        segmentValue: action.targetSegment.split(':')[1] || action.targetSegment,
-                      })
-                    }
-                  >
-                    <div className="smart-action-main">
-                      <span className="smart-priority-badge">#{action.priority}</span>
-                      <div>
-                        <p className="smart-action-title">{formatToken(action.recommendedInternalAction)}</p>
-                        <p className="smart-action-why">{action.why}</p>
+            {data.knowledgeGapInsights.length > 0 ? (
+              <div className="smart-insight-list">
+                {data.knowledgeGapInsights.slice(0, 3).map((item, index) => (
+                  <article key={`${item.knowledgeGapLabel}-${item.primaryFrictionPointLabel}-${index}`} className="smart-insight-item">
+                    <div className="smart-insight-head">
+                      <span className="smart-insight-rank">#{index + 1}</span>
+                      <div className="smart-insight-tags">
+                        <span className="smart-insight-tag">Gap: {item.knowledgeGapLabel}</span>
+                        <span className="smart-insight-tag">Friction: {item.primaryFrictionPointLabel}</span>
+                        <span className="smart-insight-tag">Action: {item.recommendedInternalActionLabel}</span>
                       </div>
                     </div>
-                    <div className="smart-action-meta">
-                      <span>{action.targetSegment}</span>
-                      <span>Criterion: {formatCriterionLabel(action.linkedCriterion)}</span>
-                      <span className={`smart-impact-badge smart-impact-${action.expectedImpact}`}>
-                        Impact {formatToken(action.expectedImpact)}
-                      </span>
-                      <span>
-                        Evidence: {formatInteger(action.evidence.calls)} calls ({formatPercent(action.evidence.sharePercent)})
-                      </span>
+                    <p className="smart-insight-text">{item.conciseExplanation}</p>
+                    <p className="smart-insight-evidence">
+                      Evidence: {formatInteger(item.evidence.calls)} calls ({formatPercent(item.evidence.sharePercent)})
+                    </p>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <p className="smart-empty-note">No clear knowledge-gap pattern in this window.</p>
+            )}
+          </section>
+
+          <section className="smart-report-section">
+            <div className="smart-report-section-head">
+              <h3>Most Common Failure Types</h3>
+              <p>What fails most often and why.</p>
+            </div>
+
+            {data.failureTypeInsights.length > 0 ? (
+              <div className="smart-insight-list">
+                {data.failureTypeInsights.slice(0, 3).map((item, index) => (
+                  <article key={`${item.failureTypeLabel}-${index}`} className="smart-insight-item">
+                    <div className="smart-insight-head">
+                      <span className="smart-insight-rank">#{index + 1}</span>
+                      <h4 className="smart-insight-title">{item.failureTypeLabel}</h4>
                     </div>
-                  </button>
-                </li>
-              ))}
-            </ol>
-          </div>
+                    <p className="smart-insight-text">{item.whyItHappens}</p>
+                    <p className="smart-insight-meta">
+                      Related friction: {item.relatedFriction} • Related knowledge gap: {item.relatedKnowledgeGap}
+                    </p>
+                    <p className="smart-insight-evidence">
+                      Evidence: {formatInteger(item.evidence.calls)} calls ({formatPercent(item.evidence.sharePercent)})
+                    </p>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <p className="smart-empty-note">No dominant failure type in this window.</p>
+            )}
+          </section>
 
-          <div className="page-surface smart-hotspots-surface">
-            <div className="smart-section-header">
-              <h3>Hotspots</h3>
-              <p>Sorted by weighted criteria fail rate.</p>
+          <section className="smart-report-section">
+            <div className="smart-report-section-head">
+              <h3>Priority Action Queue</h3>
+              <p>Top next actions for frontline support agents.</p>
             </div>
-            <div className="smart-hotspots-table-wrap">
-              <table className="smart-hotspots-table">
-                <thead>
-                  <tr>
-                    <th>Segment</th>
-                    <th>Calls</th>
-                    <th>Unresolved %</th>
-                    <th>Criteria Fail %</th>
-                    <th>Friction</th>
-                    <th>Knowledge Gap</th>
-                    <th>Confidence</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {hotspots.map((hotspot) => (
-                    <tr key={`${hotspot.segmentType}:${hotspot.segmentValue}`}>
-                      <td>
-                        <button
-                          type="button"
-                          className="smart-segment-link"
-                          onClick={() =>
-                            storeDrilldownContext({
-                              source: 'hotspots',
-                              segmentType: hotspot.segmentType,
-                              segmentValue: hotspot.segmentValue,
-                            })
-                          }
-                        >
-                          {formatSegmentType(hotspot.segmentType)}: {formatToken(hotspot.segmentValue)}
-                        </button>
-                      </td>
-                      <td>{formatInteger(hotspot.calls)}</td>
-                      <td>{formatPercent(hotspot.unresolvedRatePercent)}</td>
-                      <td>{formatPercent(hotspot.weightedCriteriaFailRatePercent)}</td>
-                      <td>{formatToken(hotspot.primaryFrictionPoint)}</td>
-                      <td>{formatToken(hotspot.knowledgeGapTopic)}</td>
-                      <td>
-                        <span className={`smart-confidence-badge smart-confidence-${hotspot.confidence}`}>
-                          {formatToken(hotspot.confidence)}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
 
-          {drilldownContext ? (
-            <div className="page-surface smart-drilldown-banner">
-              <p>
-                Active drilldown context: {formatSegmentType(drilldownContext.segmentType)} ={' '}
-                {formatToken(drilldownContext.segmentValue)} ({drilldownContext.source})
-              </p>
-            </div>
-          ) : null}
+            {data.priorityActionQueue.length > 0 ? (
+              <div className="smart-action-queue">
+                {data.priorityActionQueue.slice(0, 3).map((action) => (
+                  <article key={`${action.priority}-${action.actionTitle}`} className="smart-action-item-v2">
+                    <div className="smart-action-head-v2">
+                      <span className="smart-action-priority-v2">#{action.priority}</span>
+                      <h4>{action.actionTitle}</h4>
+                    </div>
+                    <p className="smart-action-line-v2">
+                      <strong>Why now:</strong> {action.whyNow}
+                    </p>
+                    <p className="smart-action-line-v2">
+                      <strong>Agent next step:</strong> {action.agentNextStep}
+                    </p>
+                    <p className="smart-action-line-v2">
+                      <strong>Escalation trigger:</strong> {action.escalationTrigger}
+                    </p>
+                    <p className="smart-action-line-v2">
+                      <strong>Applies to:</strong> {action.appliesTo}
+                    </p>
+                    <p className="smart-insight-evidence">
+                      Evidence: {formatInteger(action.evidence.calls)} calls ({formatPercent(action.evidence.sharePercent)})
+                    </p>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <p className="smart-empty-note">No priority actions available for this window.</p>
+            )}
+          </section>
 
-          <div className="page-surface smart-data-quality-surface">
-            <div className="smart-section-header">
-              <h3>Data Quality</h3>
-              <p>{formatPercent(data.meta.dataCoveragePercent)} overall field coverage.</p>
+          <section className="smart-report-section">
+            <div className="smart-report-section-head">
+              <h3>Caveats</h3>
+              <p>Important context to keep in mind.</p>
             </div>
-            <div className="smart-missing-field-grid">
-              {data.dataQuality.missingFieldRates.map((item) => (
-                <span key={item.field} className="smart-missing-chip">
-                  {formatToken(item.field)} missing {formatPercent(item.missingPercent)}
-                </span>
-              ))}
-            </div>
-            {data.dataQuality.caveats.length > 0 ? (
+            {data.caveats.length > 0 ? (
               <ul className="smart-caveats-list">
-                {data.dataQuality.caveats.map((caveat) => (
+                {data.caveats.map((caveat) => (
                   <li key={caveat}>{caveat}</li>
                 ))}
               </ul>
-            ) : null}
-          </div>
-        </>
+            ) : (
+              <p className="smart-empty-note">No major caveats for this period.</p>
+            )}
+          </section>
+        </article>
       ) : null}
     </section>
   );

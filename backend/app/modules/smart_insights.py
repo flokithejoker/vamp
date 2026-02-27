@@ -1,31 +1,43 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
+import os
 import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.config.customer_agent import CUSTOMER_AGENT_CONFIG
-from app.providers.elevenlabs import list_agent_conversations
+from app.providers.elevenlabs import get_conversation_details, list_agent_conversations
 from app.providers.openai import OpenAIApiError, create_structured_chat_completion
 
 TimelineKey = Literal["1d", "7d", "1m"]
-SegmentType = Literal["hotel_location", "user_intent", "booking_stage", "topics"]
 CriterionKey = Literal["human_escalation", "intent_identification", "call_cancellation"]
 CriterionState = Literal["pass", "fail", "unknown"]
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGES = 200
 MAX_CALLS = 500
+SMART_INSIGHTS_DETAIL_CAP_ENV = "SMART_INSIGHTS_DETAIL_CAP"
+SMART_INSIGHTS_DETAIL_FETCH_CONCURRENCY_ENV = "SMART_INSIGHTS_DETAIL_FETCH_CONCURRENCY"
+SMART_INSIGHTS_DETAIL_CAP_DEFAULT = 200
+SMART_INSIGHTS_DETAIL_FETCH_CONCURRENCY_DEFAULT = 8
+REPORT_VERSION = 2
 
-CRITERION_WEIGHTS: dict[CriterionKey, float] = {
-    "human_escalation": 0.5,
-    "intent_identification": 0.3,
-    "call_cancellation": 0.2,
+CRITERIA_KEYS: tuple[CriterionKey, ...] = (
+    "human_escalation",
+    "intent_identification",
+    "call_cancellation",
+)
+
+CRITERION_LABELS: dict[CriterionKey, str] = {
+    "human_escalation": "Human handoff needed",
+    "intent_identification": "Intent misunderstood",
+    "call_cancellation": "Call ended before completion",
 }
 
 DATA_FIELD_KEYS = (
@@ -49,13 +61,19 @@ SCALAR_FIELD_KEYS = (
     "booking_stage",
 )
 
-CRITERIA_KEYS: tuple[CriterionKey, ...] = (
-    "human_escalation",
-    "intent_identification",
-    "call_cancellation",
-)
+DATA_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "hotel_location": ("hotel_location",),
+    "recommended_internal_action": ("recommended_internal_action",),
+    "knowledge_gap_topic": ("knowledge_gap_topic", "knowledge_gap"),
+    "primary_friction_point": ("primary_friction_point", "friction_point"),
+    "user_intent": ("user_intent",),
+    "resolution_status": ("resolution_status",),
+    "booking_stage": ("booking_stage",),
+    "topics": ("topics",),
+}
 
-MISSING_VALUE_SET = {"unknown", "none", "not_applicable", "n_a", "na"}
+# Explicit taxonomy labels like none/other/no_action_needed are valid values and count as present.
+MISSING_VALUE_SET = {"unknown", "not_applicable", "n_a", "na", "not_available", ""}
 TOKEN_SANITIZER_PATTERN = re.compile(r"[^a-z0-9]+")
 
 
@@ -73,16 +91,16 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class TopMetricItem(StrictModel):
-    value: str
-    calls: int = Field(ge=0)
-    sharePercent: float = Field(ge=0, le=100)
-
-
 class SmartInsightsMeta(StrictModel):
+    reportVersion: Literal[2]
     timeline: TimelineKey
     generatedAtIso: str
     totalCalls: int = Field(ge=0)
+    availableCalls: int = Field(ge=0)
+    analyzedCalls: int = Field(ge=0)
+    detailFetchCap: int = Field(ge=1)
+    cappedByDetailCap: bool
+    detailFetchFailures: int = Field(ge=0)
     dataCoveragePercent: float = Field(ge=0, le=100)
 
 
@@ -92,77 +110,44 @@ class SmartInsightsOverview(StrictModel):
     topOpportunity: str
 
 
-class SmartInsightsKpis(StrictModel):
-    resolutionRatePercent: float = Field(ge=0, le=100)
-    unresolvedCalls: int = Field(ge=0)
-    criteriaHealthScore: float = Field(ge=0, le=100)
-    topIntent: TopMetricItem
-    topFrictionPoint: TopMetricItem
-
-
-class SmartInsightsCriteriaWeights(StrictModel):
-    humanEscalation: Literal[0.5]
-    intentIdentification: Literal[0.3]
-    callCancellation: Literal[0.2]
-
-
-class SmartInsightsCriteriaRates(StrictModel):
-    humanEscalation: float = Field(ge=0, le=100)
-    intentIdentification: float = Field(ge=0, le=100)
-    callCancellation: float = Field(ge=0, le=100)
-
-
-class SmartInsightsCriteria(StrictModel):
-    weights: SmartInsightsCriteriaWeights
-    passRates: SmartInsightsCriteriaRates
-    unknownRates: SmartInsightsCriteriaRates
-    keyCriterionIssue: Literal["human_escalation", "intent_identification", "call_cancellation", "none"]
-
-
-class SmartInsightsHotspot(StrictModel):
-    segmentType: SegmentType
-    segmentValue: str
-    calls: int = Field(ge=0)
-    unresolvedRatePercent: float = Field(ge=0, le=100)
-    weightedCriteriaFailRatePercent: float = Field(ge=0, le=100)
-    primaryFrictionPoint: str
-    knowledgeGapTopic: str
-    confidence: Literal["low", "medium", "high"]
-
-
-class SmartInsightsActionEvidence(StrictModel):
+class SmartInsightsEvidence(StrictModel):
     calls: int = Field(ge=0)
     sharePercent: float = Field(ge=0, le=100)
 
 
-class SmartInsightsActionQueueItem(StrictModel):
-    priority: int = Field(ge=1, le=5)
-    recommendedInternalAction: str
-    targetSegment: str
-    linkedCriterion: Literal["human_escalation", "intent_identification", "call_cancellation", "none"]
-    why: str
-    expectedImpact: Literal["low", "medium", "high"]
-    evidence: SmartInsightsActionEvidence
+class SmartInsightsKnowledgeGapInsight(StrictModel):
+    knowledgeGapLabel: str
+    primaryFrictionPointLabel: str
+    recommendedInternalActionLabel: str
+    conciseExplanation: str
+    evidence: SmartInsightsEvidence
 
 
-class SmartInsightsMissingFieldRate(StrictModel):
-    field: str
-    missingPercent: float = Field(ge=0, le=100)
+class SmartInsightsFailureTypeInsight(StrictModel):
+    failureTypeLabel: str
+    whyItHappens: str
+    evidence: SmartInsightsEvidence
+    relatedFriction: str
+    relatedKnowledgeGap: str
 
 
-class SmartInsightsDataQuality(StrictModel):
-    missingFieldRates: list[SmartInsightsMissingFieldRate]
-    caveats: list[str]
+class SmartInsightsPriorityActionItem(StrictModel):
+    priority: int = Field(ge=1, le=3)
+    actionTitle: str
+    whyNow: str
+    agentNextStep: str
+    escalationTrigger: str
+    appliesTo: str
+    evidence: SmartInsightsEvidence
 
 
 class SmartInsightsReport(StrictModel):
     meta: SmartInsightsMeta
     overview: SmartInsightsOverview
-    kpis: SmartInsightsKpis
-    criteria: SmartInsightsCriteria
-    hotspots: list[SmartInsightsHotspot]
-    actionQueue: list[SmartInsightsActionQueueItem]
-    dataQuality: SmartInsightsDataQuality
+    knowledgeGapInsights: list[SmartInsightsKnowledgeGapInsight]
+    failureTypeInsights: list[SmartInsightsFailureTypeInsight]
+    priorityActionQueue: list[SmartInsightsPriorityActionItem]
+    caveats: list[str]
 
 
 SMART_INSIGHTS_RESPONSE_SCHEMA = SmartInsightsReport.model_json_schema()
@@ -193,9 +178,7 @@ def _pick_raw_value(root: dict[str, Any], paths: list[str]) -> Any:
 
 def _pick_number(root: dict[str, Any], paths: list[str]) -> float | None:
     raw = _pick_raw_value(root, paths)
-    if raw is None:
-        return None
-    if isinstance(raw, bool):
+    if raw is None or isinstance(raw, bool):
         return None
     if isinstance(raw, (int, float)):
         parsed = float(raw)
@@ -230,6 +213,13 @@ def _normalize_token(value: str | None) -> str:
     return token or "unknown"
 
 
+def _humanize_token(value: str | None) -> str:
+    token = _normalize_token(value)
+    if token == "unknown":
+        return "Unknown"
+    return " ".join(part.capitalize() for part in token.split("_") if part)
+
+
 def _coerce_string(value: Any) -> str | None:
     if isinstance(value, str):
         trimmed = value.strip()
@@ -255,6 +245,51 @@ def _coerce_string_list(value: Any) -> list[str]:
         return [part.strip() for part in parts if part.strip()]
 
     return []
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return default
+    if parsed < minimum:
+        return default
+    if maximum is not None and parsed > maximum:
+        return maximum
+    return parsed
+
+
+def _detail_fetch_cap() -> int:
+    return _env_int(
+        SMART_INSIGHTS_DETAIL_CAP_ENV,
+        SMART_INSIGHTS_DETAIL_CAP_DEFAULT,
+        minimum=1,
+        maximum=MAX_CALLS,
+    )
+
+
+def _detail_fetch_concurrency() -> int:
+    return _env_int(
+        SMART_INSIGHTS_DETAIL_FETCH_CONCURRENCY_ENV,
+        SMART_INSIGHTS_DETAIL_FETCH_CONCURRENCY_DEFAULT,
+        minimum=1,
+        maximum=32,
+    )
+
+
+def _data_field_candidates(field_key: str) -> tuple[str, ...]:
+    return DATA_FIELD_ALIASES.get(field_key, (field_key,))
+
+
+def _unwrap_data_collection_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        for key in ("value", "result", "status"):
+            if key in value:
+                return value[key]
+    return value
 
 
 def _extract_named_item_value(collection: Any, key: str) -> Any:
@@ -310,17 +345,22 @@ def _extract_named_item_value(collection: Any, key: str) -> Any:
 
 
 def _data_collection_paths(field_key: str) -> list[str]:
-    camel = _to_camel_case(field_key)
-    return [
-        f"analysis.data_collection_results.{field_key}",
-        f"analysis.dataCollectionResults.{field_key}",
-        f"analysis.data_collection_results.{camel}",
-        f"analysis.dataCollectionResults.{camel}",
-        f"data_collection_results.{field_key}",
-        f"dataCollectionResults.{field_key}",
-        f"metadata.data_collection_results.{field_key}",
-        f"metadata.dataCollectionResults.{field_key}",
-    ]
+    paths: list[str] = []
+    for alias in _data_field_candidates(field_key):
+        camel = _to_camel_case(alias)
+        paths.extend(
+            [
+                f"analysis.data_collection_results.{alias}",
+                f"analysis.dataCollectionResults.{alias}",
+                f"analysis.data_collection_results.{camel}",
+                f"analysis.dataCollectionResults.{camel}",
+                f"data_collection_results.{alias}",
+                f"dataCollectionResults.{alias}",
+                f"metadata.data_collection_results.{alias}",
+                f"metadata.dataCollectionResults.{alias}",
+            ]
+        )
+    return paths
 
 
 def _extract_data_field(conversation: dict[str, Any], field_key: str, *, multi: bool = False) -> str | list[str]:
@@ -336,10 +376,16 @@ def _extract_data_field(conversation: dict[str, Any], field_key: str, *, multi: 
             "metadata.dataCollectionResults",
         ):
             collection = _read_path(conversation, collection_path)
-            extracted = _extract_named_item_value(collection, field_key)
-            if extracted is not None:
+            for alias in _data_field_candidates(field_key):
+                extracted = _extract_named_item_value(collection, alias)
+                if extracted is None:
+                    continue
                 raw_value = extracted
                 break
+            if raw_value is not None:
+                break
+
+    raw_value = _unwrap_data_collection_value(raw_value)
 
     if multi:
         values = [_normalize_token(item) for item in _coerce_string_list(raw_value)]
@@ -530,6 +576,55 @@ def _extract_record(conversation: dict[str, Any], index: int) -> dict[str, Any]:
     }
 
 
+def _sort_by_recency(conversations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        conversations,
+        key=lambda conversation: _extract_start_time_unix(conversation) or 0,
+        reverse=True,
+    )
+
+
+async def _build_detail_records(
+    conversations: list[dict[str, Any]],
+    *,
+    concurrency: int,
+) -> tuple[list[dict[str, Any]], int]:
+    semaphore = asyncio.Semaphore(concurrency)
+    records: list[dict[str, Any] | None] = [None] * len(conversations)
+    detail_fetch_failures = 0
+
+    async def hydrate(index: int, summary_conversation: dict[str, Any]) -> None:
+        nonlocal detail_fetch_failures
+
+        fallback_record = _extract_record(summary_conversation, index)
+        conversation_id = fallback_record.get("conversationId")
+        if not isinstance(conversation_id, str) or not conversation_id or conversation_id.startswith("unknown_"):
+            records[index] = fallback_record
+            detail_fetch_failures += 1
+            return
+
+        try:
+            async with semaphore:
+                detail_payload = await get_conversation_details(conversation_id=conversation_id)
+            detail_record = _extract_record(detail_payload.conversation, index)
+            if (
+                not isinstance(detail_record.get("startTimeUnix"), int)
+                and isinstance(fallback_record.get("startTimeUnix"), int)
+            ):
+                detail_record["startTimeUnix"] = fallback_record["startTimeUnix"]
+            if detail_record.get("conversationId", "").startswith("unknown_"):
+                detail_record["conversationId"] = conversation_id
+            records[index] = detail_record
+        except Exception:
+            detail_fetch_failures += 1
+            records[index] = fallback_record
+
+    await asyncio.gather(*(hydrate(index, conversation) for index, conversation in enumerate(conversations)))
+
+    finalized = [record for record in records if isinstance(record, dict)]
+    return finalized, detail_fetch_failures
+
+
 def _resolve_window(timeline: TimelineKey, now_unix: int) -> WindowConfig:
     if timeline == "1d":
         return WindowConfig(start_time_unix=now_unix - 86400, end_time_unix=now_unix)
@@ -554,8 +649,17 @@ def _percent(part: int | float, whole: int | float) -> float:
     return round((float(part) / float(whole)) * 100.0, 1)
 
 
+def _resolution_bucket(value: str) -> Literal["resolved", "unresolved", "unknown"]:
+    normalized = _normalize_token(value)
+    if normalized in {"resolved", "partially_resolved"}:
+        return "resolved"
+    if normalized in {"unresolved", "escalated"}:
+        return "unresolved"
+    return "unknown"
+
+
 def _top_counter(counter: Counter[str], total_calls: int) -> dict[str, Any]:
-    filtered = [(value, count) for value, count in counter.items() if value not in MISSING_VALUE_SET]
+    filtered = [(value, count) for value, count in counter.items() if not _is_missing_scalar(value)]
     if not filtered:
         return {"value": "unknown", "calls": 0, "sharePercent": 0.0}
     value, count = max(filtered, key=lambda item: (item[1], item[0]))
@@ -566,237 +670,24 @@ def _top_counter(counter: Counter[str], total_calls: int) -> dict[str, Any]:
     }
 
 
-def _resolution_bucket(value: str) -> Literal["resolved", "unresolved", "unknown"]:
-    normalized = _normalize_token(value)
-    if normalized in {"resolved", "partially_resolved"}:
-        return "resolved"
-    if normalized in {"unresolved", "escalated"}:
-        return "unresolved"
-    return "unknown"
-
-
-def _criteria_rates(records: list[dict[str, Any]]) -> dict[str, Any]:
+def _criteria_state_counts(records: list[dict[str, Any]]) -> dict[CriterionKey, dict[str, int]]:
     counts: dict[CriterionKey, dict[str, int]] = {
         "human_escalation": {"pass": 0, "fail": 0, "unknown": 0},
         "intent_identification": {"pass": 0, "fail": 0, "unknown": 0},
         "call_cancellation": {"pass": 0, "fail": 0, "unknown": 0},
     }
-
     for record in records:
         criteria = record.get("criteria")
         if not isinstance(criteria, dict):
+            for criterion_key in CRITERIA_KEYS:
+                counts[criterion_key]["unknown"] += 1
             continue
-
         for criterion_key in CRITERIA_KEYS:
             state = criteria.get(criterion_key)
             if state not in {"pass", "fail", "unknown"}:
                 state = "unknown"
             counts[criterion_key][state] += 1
-
-    pass_rates: dict[CriterionKey, float] = {
-        "human_escalation": 0.0,
-        "intent_identification": 0.0,
-        "call_cancellation": 0.0,
-    }
-    fail_rates: dict[CriterionKey, float] = {
-        "human_escalation": 0.0,
-        "intent_identification": 0.0,
-        "call_cancellation": 0.0,
-    }
-    unknown_rates: dict[CriterionKey, float] = {
-        "human_escalation": 0.0,
-        "intent_identification": 0.0,
-        "call_cancellation": 0.0,
-    }
-
-    total_calls = len(records)
-    for criterion_key in CRITERIA_KEYS:
-        known = counts[criterion_key]["pass"] + counts[criterion_key]["fail"]
-        pass_rates[criterion_key] = _percent(counts[criterion_key]["pass"], known)
-        fail_rates[criterion_key] = _percent(counts[criterion_key]["fail"], known)
-        unknown_rates[criterion_key] = _percent(counts[criterion_key]["unknown"], total_calls)
-
-    weighted_fail_rate = 0.0
-    contributions: dict[CriterionKey, float] = {
-        "human_escalation": 0.0,
-        "intent_identification": 0.0,
-        "call_cancellation": 0.0,
-    }
-
-    for criterion_key in CRITERIA_KEYS:
-        contribution = CRITERION_WEIGHTS[criterion_key] * fail_rates[criterion_key]
-        contributions[criterion_key] = contribution
-        weighted_fail_rate += contribution
-
-    criterion_issue = "none"
-    if any(contributions.values()):
-        criterion_issue = max(contributions.items(), key=lambda item: item[1])[0]
-
-    criteria_health_score = max(0.0, round(100.0 - weighted_fail_rate, 1))
-
-    return {
-        "counts": counts,
-        "passRates": pass_rates,
-        "failRates": fail_rates,
-        "unknownRates": unknown_rates,
-        "weightedFailRatePercent": round(weighted_fail_rate, 1),
-        "criteriaHealthScore": criteria_health_score,
-        "keyCriterionIssue": criterion_issue,
-    }
-
-
-def _weighted_fail_rate_for_subset(records: list[dict[str, Any]]) -> float:
-    subset_stats = _criteria_rates(records)
-    return float(subset_stats["weightedFailRatePercent"])
-
-
-def _segment_confidence(calls: int) -> Literal["low", "medium", "high"]:
-    if calls >= 30:
-        return "high"
-    if calls >= 10:
-        return "medium"
-    return "low"
-
-
-def _build_segments(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[SegmentType, str], list[dict[str, Any]]] = defaultdict(list)
-
-    for record in records:
-        for field in ("hotel_location", "user_intent", "booking_stage"):
-            value = record.get(field)
-            if not isinstance(value, str):
-                continue
-            if _is_missing_scalar(value):
-                continue
-            grouped[(field, value)].append(record)
-
-        topics = record.get("topics")
-        if isinstance(topics, list):
-            for topic in topics:
-                if not isinstance(topic, str) or _is_missing_scalar(topic):
-                    continue
-                grouped[("topics", topic)].append(record)
-
-    segments: list[dict[str, Any]] = []
-
-    for (segment_type, segment_value), segment_records in grouped.items():
-        calls = len(segment_records)
-
-        known_resolution = 0
-        unresolved_calls = 0
-        friction_counter: Counter[str] = Counter()
-        gap_counter: Counter[str] = Counter()
-
-        for record in segment_records:
-            resolution_bucket = _resolution_bucket(str(record.get("resolution_status", "unknown")))
-            if resolution_bucket in {"resolved", "unresolved"}:
-                known_resolution += 1
-                if resolution_bucket == "unresolved":
-                    unresolved_calls += 1
-
-            primary_friction = record.get("primary_friction_point")
-            if isinstance(primary_friction, str) and not _is_missing_scalar(primary_friction):
-                friction_counter[primary_friction] += 1
-
-            knowledge_gap = record.get("knowledge_gap_topic")
-            if isinstance(knowledge_gap, str) and not _is_missing_scalar(knowledge_gap):
-                gap_counter[knowledge_gap] += 1
-
-        unresolved_rate = _percent(unresolved_calls, known_resolution)
-        weighted_fail_rate = _weighted_fail_rate_for_subset(segment_records)
-
-        top_friction = _top_counter(friction_counter, calls)["value"]
-        top_gap = _top_counter(gap_counter, calls)["value"]
-
-        segments.append(
-            {
-                "segmentType": segment_type,
-                "segmentValue": segment_value,
-                "calls": calls,
-                "unresolvedRatePercent": unresolved_rate,
-                "weightedCriteriaFailRatePercent": weighted_fail_rate,
-                "primaryFrictionPoint": top_friction,
-                "knowledgeGapTopic": top_gap,
-                "confidence": _segment_confidence(calls),
-            }
-        )
-
-    segments.sort(
-        key=lambda item: (
-            -item["weightedCriteriaFailRatePercent"],
-            -item["unresolvedRatePercent"],
-            -item["calls"],
-            item["segmentType"],
-            item["segmentValue"],
-        )
-    )
-
-    return segments
-
-
-def _build_action_candidates(records: list[dict[str, Any]], total_calls: int) -> list[dict[str, Any]]:
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-
-    for record in records:
-        action = record.get("recommended_internal_action")
-        if not isinstance(action, str) or _is_missing_scalar(action):
-            continue
-        grouped[action].append(record)
-
-    action_candidates: list[dict[str, Any]] = []
-
-    for action, action_records in grouped.items():
-        calls = len(action_records)
-
-        intent_counter = Counter(
-            value
-            for value in (record.get("user_intent") for record in action_records)
-            if isinstance(value, str) and not _is_missing_scalar(value)
-        )
-        hotel_counter = Counter(
-            value
-            for value in (record.get("hotel_location") for record in action_records)
-            if isinstance(value, str) and not _is_missing_scalar(value)
-        )
-
-        target_segment = "general"
-        if intent_counter:
-            top_intent, _ = max(intent_counter.items(), key=lambda item: (item[1], item[0]))
-            target_segment = f"user_intent:{top_intent}"
-        elif hotel_counter:
-            top_hotel, _ = max(hotel_counter.items(), key=lambda item: (item[1], item[0]))
-            target_segment = f"hotel_location:{top_hotel}"
-
-        subset_stats = _criteria_rates(action_records)
-        fail_rates = subset_stats["failRates"]
-        contributions = {
-            criterion_key: CRITERION_WEIGHTS[criterion_key] * fail_rates[criterion_key]
-            for criterion_key in CRITERIA_KEYS
-        }
-        linked_criterion: str = "none"
-        if any(contributions.values()):
-            linked_criterion = max(contributions.items(), key=lambda item: item[1])[0]
-
-        action_candidates.append(
-            {
-                "recommendedInternalAction": action,
-                "calls": calls,
-                "sharePercent": _percent(calls, total_calls),
-                "targetSegment": target_segment,
-                "linkedCriterion": linked_criterion,
-                "weightedCriteriaFailRatePercent": subset_stats["weightedFailRatePercent"],
-            }
-        )
-
-    action_candidates.sort(
-        key=lambda item: (
-            -item["calls"],
-            -item["weightedCriteriaFailRatePercent"],
-            item["recommendedInternalAction"],
-        )
-    )
-
-    return action_candidates
+    return counts
 
 
 def _build_missing_field_rates(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], float]:
@@ -825,28 +716,59 @@ def _build_missing_field_rates(records: list[dict[str, Any]]) -> tuple[list[dict
             if criteria.get(criterion_key) != "unknown":
                 continue
             missing_count += 1
-
         missing_rates.append({"field": criterion_key, "missingPercent": _percent(missing_count, total_calls)})
 
     coverage_values = [100.0 - item["missingPercent"] for item in missing_rates]
     data_coverage = round(sum(coverage_values) / len(coverage_values), 1) if coverage_values else 0.0
 
     missing_rates.sort(key=lambda item: (-item["missingPercent"], item["field"]))
-
     return missing_rates, data_coverage
 
 
-def _build_locked_metrics(records: list[dict[str, Any]], criteria_stats: dict[str, Any]) -> dict[str, Any]:
-    total_calls = len(records)
+def _build_data_quality_caveats(
+    *,
+    total_calls: int,
+    data_coverage_percent: float,
+    criteria_unknown_rates: dict[CriterionKey, float],
+    missing_field_rates: list[dict[str, Any]],
+    truncated: bool,
+    capped_by_detail_cap: bool,
+    detail_fetch_failures: int,
+) -> list[str]:
+    caveats: list[str] = []
 
+    if total_calls < 20:
+        caveats.append("Low sample size for this period. Treat trends as directional, not final.")
+
+    if data_coverage_percent < 70:
+        caveats.append("Some call fields are often missing, so insights may miss part of the root cause.")
+
+    if any(rate >= 40.0 for rate in criteria_unknown_rates.values()):
+        caveats.append("Some call-quality checks are missing for many calls.")
+
+    high_missing = [item for item in missing_field_rates if float(item.get("missingPercent", 0.0)) >= 30.0]
+    if high_missing:
+        top_fields = ", ".join(_humanize_token(str(item["field"])) for item in high_missing[:2])
+        caveats.append(f"Missing data is most common in: {top_fields}.")
+
+    if truncated:
+        caveats.append("Data fetch reached the safety cap. A narrower timeline may improve precision.")
+
+    if capped_by_detail_cap:
+        caveats.append("Only the most recent calls were analyzed because of the detail analysis cap.")
+
+    if detail_fetch_failures > 0:
+        caveats.append(
+            f"{detail_fetch_failures} call details could not be loaded, so summary data was used for those calls."
+        )
+
+    return caveats
+
+
+def _resolution_stats(records: list[dict[str, Any]]) -> dict[str, float | int]:
     known_resolution = 0
     resolved_calls = 0
     unresolved_calls = 0
-
-    intent_counter: Counter[str] = Counter()
-    friction_counter: Counter[str] = Counter()
-    topic_counter: Counter[str] = Counter()
-    gap_counter: Counter[str] = Counter()
 
     for record in records:
         resolution_bucket = _resolution_bucket(str(record.get("resolution_status", "unknown")))
@@ -857,10 +779,70 @@ def _build_locked_metrics(records: list[dict[str, Any]], criteria_stats: dict[st
             else:
                 unresolved_calls += 1
 
-        user_intent = record.get("user_intent")
-        if isinstance(user_intent, str) and not _is_missing_scalar(user_intent):
-            intent_counter[user_intent] += 1
+    return {
+        "knownResolution": known_resolution,
+        "resolvedCalls": resolved_calls,
+        "unresolvedCalls": unresolved_calls,
+        "resolutionRatePercent": _percent(resolved_calls, known_resolution),
+        "unresolvedRatePercent": _percent(unresolved_calls, known_resolution),
+    }
 
+
+def _build_knowledge_gap_candidates(records: list[dict[str, Any]], total_calls: int) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+
+    for record in records:
+        gap = str(record.get("knowledge_gap_topic", "unknown"))
+        friction = str(record.get("primary_friction_point", "unknown"))
+        action = str(record.get("recommended_internal_action", "unknown"))
+        if _is_missing_scalar(gap) and _is_missing_scalar(friction) and _is_missing_scalar(action):
+            continue
+        grouped[(gap, friction, action)].append(record)
+
+    candidates: list[dict[str, Any]] = []
+    for (gap, friction, action), group_records in grouped.items():
+        calls = len(group_records)
+        known_resolution = 0
+        unresolved_calls = 0
+        for record in group_records:
+            bucket = _resolution_bucket(str(record.get("resolution_status", "unknown")))
+            if bucket in {"resolved", "unresolved"}:
+                known_resolution += 1
+                if bucket == "unresolved":
+                    unresolved_calls += 1
+
+        candidates.append(
+            {
+                "knowledgeGap": gap,
+                "primaryFrictionPoint": friction,
+                "recommendedInternalAction": action,
+                "knowledgeGapLabel": _humanize_token(gap),
+                "primaryFrictionPointLabel": _humanize_token(friction),
+                "recommendedInternalActionLabel": _humanize_token(action),
+                "calls": calls,
+                "sharePercent": _percent(calls, total_calls),
+                "unresolvedRatePercent": _percent(unresolved_calls, known_resolution),
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            -int(item["calls"]),
+            -float(item["unresolvedRatePercent"]),
+            str(item["knowledgeGap"]),
+            str(item["primaryFrictionPoint"]),
+            str(item["recommendedInternalAction"]),
+        )
+    )
+    return candidates
+
+
+def _related_context(records: list[dict[str, Any]]) -> dict[str, str]:
+    friction_counter: Counter[str] = Counter()
+    gap_counter: Counter[str] = Counter()
+    total = len(records)
+
+    for record in records:
         friction = record.get("primary_friction_point")
         if isinstance(friction, str) and not _is_missing_scalar(friction):
             friction_counter[friction] += 1
@@ -869,45 +851,226 @@ def _build_locked_metrics(records: list[dict[str, Any]], criteria_stats: dict[st
         if isinstance(gap, str) and not _is_missing_scalar(gap):
             gap_counter[gap] += 1
 
+    return {
+        "relatedFriction": _humanize_token(_top_counter(friction_counter, total)["value"]),
+        "relatedKnowledgeGap": _humanize_token(_top_counter(gap_counter, total)["value"]),
+    }
+
+
+def _build_failure_type_candidates(records: list[dict[str, Any]], total_calls: int) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+
+    for criterion_key in CRITERIA_KEYS:
+        failed_records = [
+            record
+            for record in records
+            if isinstance(record.get("criteria"), dict) and record["criteria"].get(criterion_key) == "fail"
+        ]
+        if not failed_records:
+            continue
+
+        context = _related_context(failed_records)
+        candidates.append(
+            {
+                "failureTypeKey": criterion_key,
+                "failureTypeLabel": CRITERION_LABELS[criterion_key],
+                "calls": len(failed_records),
+                "sharePercent": _percent(len(failed_records), total_calls),
+                "relatedFriction": context["relatedFriction"],
+                "relatedKnowledgeGap": context["relatedKnowledgeGap"],
+                "unresolvedRatePercent": _resolution_stats(failed_records)["unresolvedRatePercent"],
+            }
+        )
+
+    unresolved_records = [
+        record for record in records if _resolution_bucket(str(record.get("resolution_status", "unknown"))) == "unresolved"
+    ]
+    if unresolved_records:
+        context = _related_context(unresolved_records)
+        candidates.append(
+            {
+                "failureTypeKey": "unresolved_outcome",
+                "failureTypeLabel": "Issue remained unresolved",
+                "calls": len(unresolved_records),
+                "sharePercent": _percent(len(unresolved_records), total_calls),
+                "relatedFriction": context["relatedFriction"],
+                "relatedKnowledgeGap": context["relatedKnowledgeGap"],
+                "unresolvedRatePercent": 100.0,
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            -int(item["calls"]),
+            -float(item["unresolvedRatePercent"]),
+            str(item["failureTypeLabel"]),
+        )
+    )
+
+    deduped: list[dict[str, Any]] = []
+    seen_labels: set[str] = set()
+    for candidate in candidates:
+        label = str(candidate["failureTypeLabel"])
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        deduped.append(candidate)
+
+    return deduped
+
+
+def _build_applies_to_label(records: list[dict[str, Any]]) -> str:
+    counters: dict[str, Counter[str]] = {
+        "user_intent": Counter(),
+        "hotel_location": Counter(),
+        "booking_stage": Counter(),
+        "topics": Counter(),
+    }
+
+    for record in records:
+        for field in ("user_intent", "hotel_location", "booking_stage"):
+            value = record.get(field)
+            if isinstance(value, str) and not _is_missing_scalar(value):
+                counters[field][value] += 1
+
         topics = record.get("topics")
         if isinstance(topics, list):
             for topic in topics:
                 if isinstance(topic, str) and not _is_missing_scalar(topic):
-                    topic_counter[topic] += 1
+                    counters["topics"][topic] += 1
 
-    return {
-        "resolutionRatePercent": _percent(resolved_calls, known_resolution),
-        "unresolvedCalls": unresolved_calls,
-        "criteriaHealthScore": criteria_stats["criteriaHealthScore"],
-        "topIntent": _top_counter(intent_counter, total_calls),
-        "topFrictionPoint": _top_counter(friction_counter, total_calls),
-        "topTopic": _top_counter(topic_counter, total_calls),
-        "topKnowledgeGap": _top_counter(gap_counter, total_calls),
-        "criteriaPassRates": criteria_stats["passRates"],
-        "criteriaUnknownRates": criteria_stats["unknownRates"],
-        "keyCriterionIssue": criteria_stats["keyCriterionIssue"],
+    options: list[tuple[str, str, int]] = []
+    labels = {
+        "user_intent": "customer intent",
+        "hotel_location": "hotel location",
+        "booking_stage": "booking stage",
+        "topics": "topic",
     }
 
+    for field, counter in counters.items():
+        if not counter:
+            continue
+        value, count = max(counter.items(), key=lambda item: (item[1], item[0]))
+        options.append((field, value, count))
 
-def _build_data_quality_caveats(
+    if not options:
+        return "General customer calls"
+
+    field, value, _ = max(options, key=lambda item: (item[2], item[0], item[1]))
+    return f"Calls about {labels[field]} {_humanize_token(value)}"
+
+
+def _most_common_failure_label(records: list[dict[str, Any]]) -> str:
+    fail_counter: Counter[str] = Counter()
+    for criterion_key in CRITERIA_KEYS:
+        count = sum(
+            1
+            for record in records
+            if isinstance(record.get("criteria"), dict) and record["criteria"].get(criterion_key) == "fail"
+        )
+        if count > 0:
+            fail_counter[criterion_key] = count
+
+    if not fail_counter:
+        unresolved = sum(
+            1
+            for record in records
+            if _resolution_bucket(str(record.get("resolution_status", "unknown"))) == "unresolved"
+        )
+        if unresolved > 0:
+            return "Issue remained unresolved"
+        return "No dominant failure type"
+
+    top_key, _ = max(fail_counter.items(), key=lambda item: (item[1], item[0]))
+    return CRITERION_LABELS[top_key]
+
+
+def _build_priority_action_candidates(records: list[dict[str, Any]], total_calls: int) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    for record in records:
+        action = record.get("recommended_internal_action")
+        if not isinstance(action, str) or _is_missing_scalar(action):
+            continue
+        grouped[action].append(record)
+
+    candidates: list[dict[str, Any]] = []
+
+    for action, action_records in grouped.items():
+        calls = len(action_records)
+        resolution_stats = _resolution_stats(action_records)
+        failure_label = _most_common_failure_label(action_records)
+
+        candidates.append(
+            {
+                "action": action,
+                "actionTitle": _humanize_token(action),
+                "calls": calls,
+                "sharePercent": _percent(calls, total_calls),
+                "unresolvedRatePercent": float(resolution_stats["unresolvedRatePercent"]),
+                "appliesTo": _build_applies_to_label(action_records),
+                "whyNowHint": (
+                    f"This action appears in many calls and is frequently linked to {failure_label.lower()}."
+                ),
+                "agentNextStepHint": (
+                    f"In the next similar call, follow the { _humanize_token(action) } guidance and confirm the customer outcome before ending the call."
+                ),
+                "escalationTriggerHint": "Escalate if the customer repeats the same issue after one clear solution attempt.",
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            -int(item["calls"]),
+            -float(item["unresolvedRatePercent"]),
+            str(item["action"]),
+        )
+    )
+
+    return candidates
+
+
+def _determine_operational_status(resolution_rate_percent: float, unresolved_calls: int, total_calls: int) -> str:
+    if total_calls == 0:
+        return "stable"
+    unresolved_share = _percent(unresolved_calls, total_calls)
+    if resolution_rate_percent < 60.0 or unresolved_share >= 45.0:
+        return "at_risk"
+    if resolution_rate_percent < 80.0 or unresolved_share >= 25.0:
+        return "watch"
+    return "stable"
+
+
+def _deterministic_overview(
     *,
     total_calls: int,
-    data_coverage_percent: float,
-    criteria_unknown_rates: dict[CriterionKey, float],
-    truncated: bool,
-) -> list[str]:
-    caveats: list[str] = []
+    resolution_rate_percent: float,
+    unresolved_calls: int,
+    top_failure_label: str,
+    top_action_title: str,
+) -> dict[str, str]:
+    if total_calls == 0:
+        return {
+            "summary": "No calls were available for this timeline.",
+            "operationalStatus": "stable",
+            "topOpportunity": "Collect more calls before drawing operational conclusions.",
+        }
 
-    if total_calls < 20:
-        caveats.append("Low sample size for the selected period; treat trends as directional.")
-    if data_coverage_percent < 70:
-        caveats.append("Several extracted fields are missing frequently; insights may underrepresent root causes.")
-    if any(rate >= 40.0 for rate in criteria_unknown_rates.values()):
-        caveats.append("Evaluation criteria coverage is incomplete for many calls.")
-    if truncated:
-        caveats.append("Data fetch reached safety cap; consider a narrower timeline for full precision.")
+    summary = (
+        f"You handled {total_calls} calls in this period with a {round(resolution_rate_percent)}% resolution rate. "
+        f"The most frequent failure pattern is {top_failure_label.lower()}."
+    )
+    opportunity = (
+        f"Focus on {top_action_title.lower()} first to reduce repeated friction and unresolved calls."
+        if top_action_title != "Unknown"
+        else "Focus on the most repeated failure pattern first to reduce unresolved calls."
+    )
 
-    return caveats
+    return {
+        "summary": summary,
+        "operationalStatus": _determine_operational_status(resolution_rate_percent, unresolved_calls, total_calls),
+        "topOpportunity": opportunity,
+    }
 
 
 def _build_report_input(
@@ -915,82 +1078,152 @@ def _build_report_input(
     timeline: TimelineKey,
     generated_at_iso: str,
     total_calls: int,
+    available_calls: int,
+    analyzed_calls: int,
+    detail_fetch_cap: int,
+    capped_by_detail_cap: bool,
+    detail_fetch_failures: int,
     data_coverage_percent: float,
-    locked_metrics: dict[str, Any],
-    segments: list[dict[str, Any]],
+    resolution_rate_percent: float,
+    unresolved_calls: int,
+    knowledge_gap_candidates: list[dict[str, Any]],
+    failure_type_candidates: list[dict[str, Any]],
     action_candidates: list[dict[str, Any]],
+    caveats: list[str],
 ) -> dict[str, Any]:
+    top_failure = failure_type_candidates[0]["failureTypeLabel"] if failure_type_candidates else "No dominant failure type"
+    top_action = action_candidates[0]["actionTitle"] if action_candidates else "Unknown"
+
     return {
         "meta": {
+            "report_version": REPORT_VERSION,
             "timeline": timeline,
             "timezone": CUSTOMER_AGENT_CONFIG.timezone,
             "generated_at_iso": generated_at_iso,
             "total_calls": total_calls,
+            "available_calls": available_calls,
+            "analyzed_calls": analyzed_calls,
+            "detail_fetch_cap": detail_fetch_cap,
+            "capped_by_detail_cap": capped_by_detail_cap,
+            "detail_fetch_failures": detail_fetch_failures,
             "data_coverage_percent": data_coverage_percent,
         },
-        "weights": {
-            "human_escalation": CRITERION_WEIGHTS["human_escalation"],
-            "intent_identification": CRITERION_WEIGHTS["intent_identification"],
-            "call_cancellation": CRITERION_WEIGHTS["call_cancellation"],
+        "overview_locked": {
+            "resolution_rate_percent": resolution_rate_percent,
+            "unresolved_calls": unresolved_calls,
+            "top_failure_type": top_failure,
+            "top_action": top_action,
         },
-        "locked_metrics": {
-            "resolution_rate_percent": locked_metrics["resolutionRatePercent"],
-            "unresolved_calls": locked_metrics["unresolvedCalls"],
-            "criteria_health_score": locked_metrics["criteriaHealthScore"],
-            "top_intent": locked_metrics["topIntent"],
-            "top_friction_point": locked_metrics["topFrictionPoint"],
-            "top_topic": locked_metrics["topTopic"],
-            "top_knowledge_gap": locked_metrics["topKnowledgeGap"],
-            "criteria_pass_rates": locked_metrics["criteriaPassRates"],
-            "criteria_unknown_rates": locked_metrics["criteriaUnknownRates"],
-            "key_criterion_issue": locked_metrics["keyCriterionIssue"],
-        },
-        "hotspot_candidates": segments[:15],
-        "action_candidates": action_candidates[:10],
+        "knowledge_gap_candidates": knowledge_gap_candidates[:8],
+        "failure_type_candidates": failure_type_candidates[:8],
+        "priority_action_candidates": action_candidates[:8],
+        "caveats": caveats,
     }
 
 
 SYSTEM_PROMPT = (
-    "You are a support operations analyst for customer support agents. "
-    "Produce strictly valid JSON matching the provided schema. "
-    "Do not output markdown. "
-    "Use only values from the input payload and do not invent categories or segments. "
-    "Every hotspot and action must include numeric evidence. "
-    "Prioritize recommendations using impact multiplied by frequency, with weighted criteria emphasis. "
-    "If evidence is weak due to sample size or missing fields, set confidence to low and mention caveats."
+    "You are a support operations analyst writing reports for non-technical customer support agents. "
+    "Return strictly valid JSON matching the schema. Do not output markdown. "
+    "Use plain English. Avoid variable names, snake_case, and technical jargon. "
+    "Do not mention weighted criteria, scoring formulas, or internal model mechanics. "
+    "Keep explanations concise: one to two sentences each. "
+    "Prioritize by frequency first, then unresolved impact. "
+    "Action items must be practical and directly usable by frontline agents."
 )
 
 
-def _deterministic_fallback_hotspots(segments: list[dict[str, Any]]) -> list[SmartInsightsHotspot]:
-    return [SmartInsightsHotspot.model_validate(item) for item in segments[:8]]
+def _deterministic_fallback_knowledge_gap_insights(
+    candidates: list[dict[str, Any]],
+) -> list[SmartInsightsKnowledgeGapInsight]:
+    insights: list[SmartInsightsKnowledgeGapInsight] = []
+
+    for candidate in candidates[:3]:
+        gap_label = str(candidate.get("knowledgeGapLabel", "Unknown"))
+        friction_label = str(candidate.get("primaryFrictionPointLabel", "Unknown"))
+        action_label = str(candidate.get("recommendedInternalActionLabel", "Unknown"))
+        insights.append(
+            SmartInsightsKnowledgeGapInsight.model_validate(
+                {
+                    "knowledgeGapLabel": gap_label,
+                    "primaryFrictionPointLabel": friction_label,
+                    "recommendedInternalActionLabel": action_label,
+                    "conciseExplanation": (
+                        f"Calls in this cluster often break down around {friction_label.lower()} when {gap_label.lower()} is not clear. "
+                        f"Use {action_label.lower()} to reduce repeat confusion."
+                    ),
+                    "evidence": {
+                        "calls": int(candidate.get("calls", 0)),
+                        "sharePercent": float(candidate.get("sharePercent", 0.0)),
+                    },
+                }
+            )
+        )
+
+    return insights
 
 
-def _deterministic_fallback_actions(action_candidates: list[dict[str, Any]]) -> list[SmartInsightsActionQueueItem]:
-    impact_map = {
-        "high": 60.0,
-        "medium": 30.0,
-    }
-    actions: list[SmartInsightsActionQueueItem] = []
-    for index, item in enumerate(action_candidates[:5], start=1):
-        weighted_fail_rate = float(item["weightedCriteriaFailRatePercent"])
-        expected_impact = "low"
-        if weighted_fail_rate >= impact_map["high"]:
-            expected_impact = "high"
-        elif weighted_fail_rate >= impact_map["medium"]:
-            expected_impact = "medium"
+def _deterministic_fallback_failure_type_insights(
+    candidates: list[dict[str, Any]],
+) -> list[SmartInsightsFailureTypeInsight]:
+    insights: list[SmartInsightsFailureTypeInsight] = []
 
+    for candidate in candidates[:3]:
+        failure_label = str(candidate.get("failureTypeLabel", "Unknown"))
+        friction = str(candidate.get("relatedFriction", "Unknown"))
+        gap = str(candidate.get("relatedKnowledgeGap", "Unknown"))
+        insights.append(
+            SmartInsightsFailureTypeInsight.model_validate(
+                {
+                    "failureTypeLabel": failure_label,
+                    "whyItHappens": (
+                        f"This issue appears repeatedly and is often tied to {friction.lower()} and gaps around {gap.lower()}."
+                    ),
+                    "evidence": {
+                        "calls": int(candidate.get("calls", 0)),
+                        "sharePercent": float(candidate.get("sharePercent", 0.0)),
+                    },
+                    "relatedFriction": friction,
+                    "relatedKnowledgeGap": gap,
+                }
+            )
+        )
+
+    return insights
+
+
+def _deterministic_fallback_priority_actions(
+    candidates: list[dict[str, Any]],
+) -> list[SmartInsightsPriorityActionItem]:
+    actions: list[SmartInsightsPriorityActionItem] = []
+
+    for index, candidate in enumerate(candidates[:3], start=1):
         actions.append(
-            SmartInsightsActionQueueItem.model_validate(
+            SmartInsightsPriorityActionItem.model_validate(
                 {
                     "priority": index,
-                    "recommendedInternalAction": item["recommendedInternalAction"],
-                    "targetSegment": item["targetSegment"],
-                    "linkedCriterion": item["linkedCriterion"],
-                    "why": "High recurrence and elevated criteria failure in this segment.",
-                    "expectedImpact": expected_impact,
+                    "actionTitle": str(candidate.get("actionTitle", "Follow standard playbook")),
+                    "whyNow": str(
+                        candidate.get(
+                            "whyNowHint",
+                            "This is one of the most repeated patterns in recent calls.",
+                        )
+                    ),
+                    "agentNextStep": str(
+                        candidate.get(
+                            "agentNextStepHint",
+                            "Apply the standard handling flow and confirm the customer is satisfied before ending.",
+                        )
+                    ),
+                    "escalationTrigger": str(
+                        candidate.get(
+                            "escalationTriggerHint",
+                            "Escalate if the customer repeats the issue after one clear solution attempt.",
+                        )
+                    ),
+                    "appliesTo": str(candidate.get("appliesTo", "General customer calls")),
                     "evidence": {
-                        "calls": item["calls"],
-                        "sharePercent": item["sharePercent"],
+                        "calls": int(candidate.get("calls", 0)),
+                        "sharePercent": float(candidate.get("sharePercent", 0.0)),
                     },
                 }
             )
@@ -1008,7 +1241,7 @@ async def _generate_llm_report(report_input: dict[str, Any]) -> SmartInsightsRep
             system_prompt=SYSTEM_PROMPT,
             user_payload=payload,
             json_schema=SMART_INSIGHTS_RESPONSE_SCHEMA,
-            schema_name="smart_insights_report",
+            schema_name="smart_insights_report_v2",
             temperature=0.2,
         )
 
@@ -1031,182 +1264,224 @@ async def _generate_llm_report(report_input: dict[str, Any]) -> SmartInsightsRep
     raise SmartInsightsGenerationError("Unexpected report validation failure.")
 
 
+def _build_fallback_report(
+    *,
+    timeline: TimelineKey,
+    generated_at_iso: str,
+    total_calls: int,
+    available_calls: int,
+    analyzed_calls: int,
+    detail_fetch_cap: int,
+    capped_by_detail_cap: bool,
+    detail_fetch_failures: int,
+    data_coverage_percent: float,
+    overview: dict[str, str],
+    knowledge_gap_candidates: list[dict[str, Any]],
+    failure_type_candidates: list[dict[str, Any]],
+    action_candidates: list[dict[str, Any]],
+    caveats: list[str],
+) -> dict[str, Any]:
+    report = SmartInsightsReport.model_validate(
+        {
+            "meta": {
+                "reportVersion": REPORT_VERSION,
+                "timeline": timeline,
+                "generatedAtIso": generated_at_iso,
+                "totalCalls": total_calls,
+                "availableCalls": available_calls,
+                "analyzedCalls": analyzed_calls,
+                "detailFetchCap": detail_fetch_cap,
+                "cappedByDetailCap": capped_by_detail_cap,
+                "detailFetchFailures": detail_fetch_failures,
+                "dataCoveragePercent": data_coverage_percent,
+            },
+            "overview": {
+                "summary": overview["summary"],
+                "operationalStatus": overview["operationalStatus"],
+                "topOpportunity": overview["topOpportunity"],
+            },
+            "knowledgeGapInsights": [
+                item.model_dump() for item in _deterministic_fallback_knowledge_gap_insights(knowledge_gap_candidates)
+            ],
+            "failureTypeInsights": [
+                item.model_dump() for item in _deterministic_fallback_failure_type_insights(failure_type_candidates)
+            ],
+            "priorityActionQueue": [
+                item.model_dump() for item in _deterministic_fallback_priority_actions(action_candidates)
+            ],
+            "caveats": caveats,
+        }
+    )
+    return report.model_dump()
+
+
 def _enforce_locked_fields(
     *,
     report: SmartInsightsReport,
     timeline: TimelineKey,
     generated_at_iso: str,
     total_calls: int,
+    available_calls: int,
+    analyzed_calls: int,
+    detail_fetch_cap: int,
+    capped_by_detail_cap: bool,
+    detail_fetch_failures: int,
     data_coverage_percent: float,
-    locked_metrics: dict[str, Any],
-    missing_field_rates: list[dict[str, Any]],
-    caveats: list[str],
-    segments: list[dict[str, Any]],
+    overview: dict[str, str],
+    knowledge_gap_candidates: list[dict[str, Any]],
+    failure_type_candidates: list[dict[str, Any]],
     action_candidates: list[dict[str, Any]],
-) -> SmartInsightsReport:
+    caveats: list[str],
+) -> dict[str, Any]:
     report_data = report.model_dump()
 
     report_data["meta"] = {
+        "reportVersion": REPORT_VERSION,
         "timeline": timeline,
         "generatedAtIso": generated_at_iso,
         "totalCalls": total_calls,
+        "availableCalls": available_calls,
+        "analyzedCalls": analyzed_calls,
+        "detailFetchCap": detail_fetch_cap,
+        "cappedByDetailCap": capped_by_detail_cap,
+        "detailFetchFailures": detail_fetch_failures,
         "dataCoveragePercent": data_coverage_percent,
     }
 
-    report_data["kpis"] = {
-        "resolutionRatePercent": locked_metrics["resolutionRatePercent"],
-        "unresolvedCalls": locked_metrics["unresolvedCalls"],
-        "criteriaHealthScore": locked_metrics["criteriaHealthScore"],
-        "topIntent": locked_metrics["topIntent"],
-        "topFrictionPoint": locked_metrics["topFrictionPoint"],
+    report_data["overview"] = {
+        "summary": str(report_data.get("overview", {}).get("summary", "")).strip() or overview["summary"],
+        "operationalStatus": report_data.get("overview", {}).get("operationalStatus") or overview["operationalStatus"],
+        "topOpportunity": str(report_data.get("overview", {}).get("topOpportunity", "")).strip()
+        or overview["topOpportunity"],
     }
 
-    report_data["criteria"] = {
-        "weights": {
-            "humanEscalation": CRITERION_WEIGHTS["human_escalation"],
-            "intentIdentification": CRITERION_WEIGHTS["intent_identification"],
-            "callCancellation": CRITERION_WEIGHTS["call_cancellation"],
-        },
-        "passRates": {
-            "humanEscalation": locked_metrics["criteriaPassRates"]["human_escalation"],
-            "intentIdentification": locked_metrics["criteriaPassRates"]["intent_identification"],
-            "callCancellation": locked_metrics["criteriaPassRates"]["call_cancellation"],
-        },
-        "unknownRates": {
-            "humanEscalation": locked_metrics["criteriaUnknownRates"]["human_escalation"],
-            "intentIdentification": locked_metrics["criteriaUnknownRates"]["intent_identification"],
-            "callCancellation": locked_metrics["criteriaUnknownRates"]["call_cancellation"],
-        },
-        "keyCriterionIssue": locked_metrics["keyCriterionIssue"],
-    }
-
-    if not report_data.get("hotspots"):
-        report_data["hotspots"] = [item.model_dump() for item in _deterministic_fallback_hotspots(segments)]
-
-    if not report_data.get("actionQueue"):
-        report_data["actionQueue"] = [item.model_dump() for item in _deterministic_fallback_actions(action_candidates)]
-
-    normalized_actions: list[dict[str, Any]] = []
-    raw_actions = report_data.get("actionQueue")
-    if isinstance(raw_actions, list):
-        for raw_action in raw_actions:
-            if not isinstance(raw_action, dict):
+    fallback_gap = _deterministic_fallback_knowledge_gap_insights(knowledge_gap_candidates)
+    normalized_gap: list[SmartInsightsKnowledgeGapInsight] = []
+    raw_gap = report_data.get("knowledgeGapInsights")
+    if isinstance(raw_gap, list):
+        for item in raw_gap:
+            if not isinstance(item, dict):
                 continue
-            normalized_actions.append(raw_action)
+            try:
+                normalized_gap.append(SmartInsightsKnowledgeGapInsight.model_validate(item))
+            except ValidationError:
+                continue
+    if len(normalized_gap) < 3:
+        normalized_gap.extend(fallback_gap[: 3 - len(normalized_gap)])
+    report_data["knowledgeGapInsights"] = [item.model_dump() for item in normalized_gap[:3]]
+
+    fallback_failure = _deterministic_fallback_failure_type_insights(failure_type_candidates)
+    normalized_failure: list[SmartInsightsFailureTypeInsight] = []
+    raw_failure = report_data.get("failureTypeInsights")
+    if isinstance(raw_failure, list):
+        for item in raw_failure:
+            if not isinstance(item, dict):
+                continue
+            try:
+                normalized_failure.append(SmartInsightsFailureTypeInsight.model_validate(item))
+            except ValidationError:
+                continue
+    if len(normalized_failure) < 3:
+        normalized_failure.extend(fallback_failure[: 3 - len(normalized_failure)])
+    report_data["failureTypeInsights"] = [item.model_dump() for item in normalized_failure[:3]]
+
+    fallback_actions = _deterministic_fallback_priority_actions(action_candidates)
+    normalized_actions: list[SmartInsightsPriorityActionItem] = []
+    raw_actions = report_data.get("priorityActionQueue")
+    if isinstance(raw_actions, list):
+        for item in raw_actions:
+            if not isinstance(item, dict):
+                continue
+            try:
+                normalized_actions.append(SmartInsightsPriorityActionItem.model_validate(item))
+            except ValidationError:
+                continue
+    if len(normalized_actions) < 3:
+        normalized_actions.extend(fallback_actions[: 3 - len(normalized_actions)])
 
     normalized_actions.sort(
         key=lambda item: (
-            int(item.get("priority", 99)),
-            -int(_read_path(item, "evidence.calls") or 0),
-            str(item.get("recommendedInternalAction", "")),
+            int(item.priority),
+            -int(item.evidence.calls),
+            item.actionTitle,
         )
     )
-    for index, action in enumerate(normalized_actions[:5], start=1):
-        action["priority"] = index
-    report_data["actionQueue"] = normalized_actions[:5]
 
-    raw_hotspots = report_data.get("hotspots")
-    normalized_hotspots: list[dict[str, Any]] = []
-    if isinstance(raw_hotspots, list):
-        for raw_hotspot in raw_hotspots:
-            if isinstance(raw_hotspot, dict):
-                normalized_hotspots.append(raw_hotspot)
+    action_dump: list[dict[str, Any]] = []
+    for index, action in enumerate(normalized_actions[:3], start=1):
+        dumped = action.model_dump()
+        dumped["priority"] = index
+        action_dump.append(dumped)
+    report_data["priorityActionQueue"] = action_dump
 
-    normalized_hotspots.sort(
-        key=lambda item: (
-            -float(item.get("weightedCriteriaFailRatePercent", 0.0)),
-            -float(item.get("unresolvedRatePercent", 0.0)),
-            -int(item.get("calls", 0)),
-        )
-    )
-    report_data["hotspots"] = normalized_hotspots[:12]
+    model_caveats = report_data.get("caveats") if isinstance(report_data.get("caveats"), list) else []
+    merged_caveats = [item for item in caveats if isinstance(item, str) and item.strip()]
+    for caveat in model_caveats:
+        if not isinstance(caveat, str):
+            continue
+        trimmed = caveat.strip()
+        if not trimmed or trimmed in merged_caveats:
+            continue
+        merged_caveats.append(trimmed)
+    if not merged_caveats:
+        merged_caveats = ["No major data caveats were detected for this timeline."]
+    report_data["caveats"] = merged_caveats
 
-    model_caveats = report_data.get("dataQuality", {}).get("caveats") if isinstance(report_data.get("dataQuality"), dict) else None
-    merged_caveats = [caveat for caveat in caveats]
-    if isinstance(model_caveats, list):
-        for caveat in model_caveats:
-            if not isinstance(caveat, str):
-                continue
-            trimmed = caveat.strip()
-            if not trimmed or trimmed in merged_caveats:
-                continue
-            merged_caveats.append(trimmed)
-
-    report_data["dataQuality"] = {
-        "missingFieldRates": missing_field_rates,
-        "caveats": merged_caveats,
-    }
-
-    return SmartInsightsReport.model_validate(report_data)
+    return SmartInsightsReport.model_validate(report_data).model_dump()
 
 
 def _empty_report(
     *,
     timeline: TimelineKey,
     generated_at_iso: str,
-    missing_field_rates: list[dict[str, Any]],
     data_coverage_percent: float,
-) -> SmartInsightsReport:
+    available_calls: int,
+    analyzed_calls: int,
+    detail_fetch_cap: int,
+    capped_by_detail_cap: bool,
+    detail_fetch_failures: int,
+) -> dict[str, Any]:
     return SmartInsightsReport.model_validate(
         {
             "meta": {
+                "reportVersion": REPORT_VERSION,
                 "timeline": timeline,
                 "generatedAtIso": generated_at_iso,
                 "totalCalls": 0,
+                "availableCalls": available_calls,
+                "analyzedCalls": analyzed_calls,
+                "detailFetchCap": detail_fetch_cap,
+                "cappedByDetailCap": capped_by_detail_cap,
+                "detailFetchFailures": detail_fetch_failures,
                 "dataCoveragePercent": data_coverage_percent,
             },
             "overview": {
-                "summary": "No calls found for the selected timeline.",
+                "summary": "No calls were available for this timeline.",
                 "operationalStatus": "stable",
                 "topOpportunity": "Collect more calls before drawing operational conclusions.",
             },
-            "kpis": {
-                "resolutionRatePercent": 0.0,
-                "unresolvedCalls": 0,
-                "criteriaHealthScore": 100.0,
-                "topIntent": {"value": "unknown", "calls": 0, "sharePercent": 0.0},
-                "topFrictionPoint": {"value": "unknown", "calls": 0, "sharePercent": 0.0},
-            },
-            "criteria": {
-                "weights": {
-                    "humanEscalation": 0.5,
-                    "intentIdentification": 0.3,
-                    "callCancellation": 0.2,
-                },
-                "passRates": {
-                    "humanEscalation": 0.0,
-                    "intentIdentification": 0.0,
-                    "callCancellation": 0.0,
-                },
-                "unknownRates": {
-                    "humanEscalation": 100.0,
-                    "intentIdentification": 100.0,
-                    "callCancellation": 100.0,
-                },
-                "keyCriterionIssue": "none",
-            },
-            "hotspots": [],
-            "actionQueue": [],
-            "dataQuality": {
-                "missingFieldRates": missing_field_rates,
-                "caveats": ["No conversations available in this window."],
-            },
+            "knowledgeGapInsights": [],
+            "failureTypeInsights": [],
+            "priorityActionQueue": [],
+            "caveats": ["No conversations available in this window."],
         }
-    )
+    ).model_dump()
 
 
 async def get_smart_insights_report(*, timeline: TimelineKey) -> dict[str, Any]:
     now_unix = int(datetime.now(tz=timezone.utc).timestamp())
     generated_at_iso = datetime.now(tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     window = _resolve_window(timeline, now_unix)
+    detail_fetch_cap = _detail_fetch_cap()
+    detail_fetch_concurrency = _detail_fetch_concurrency()
 
-    records: list[dict[str, Any]] = []
+    candidate_conversations: list[dict[str, Any]] = []
     cursor: str | None = None
     has_more = True
     pages = 0
     truncated = False
 
-    while has_more and pages < MAX_PAGES and len(records) < MAX_CALLS:
+    while has_more and pages < MAX_PAGES and len(candidate_conversations) < MAX_CALLS:
         payload = await list_agent_conversations(
             agent_id=CUSTOMER_AGENT_CONFIG.elevenlabs_agent_id,
             page_size=DEFAULT_PAGE_SIZE,
@@ -1217,13 +1492,12 @@ async def get_smart_insights_report(*, timeline: TimelineKey) -> dict[str, Any]:
         )
         pages += 1
 
-        for index, conversation in enumerate(payload.conversations):
-            record = _extract_record(conversation, index)
-            start_time = record.get("startTimeUnix")
+        for conversation in payload.conversations:
+            start_time = _extract_start_time_unix(conversation)
             if isinstance(start_time, int) and (start_time < window.start_time_unix or start_time > window.end_time_unix):
                 continue
-            records.append(record)
-            if len(records) >= MAX_CALLS:
+            candidate_conversations.append(conversation)
+            if len(candidate_conversations) >= MAX_CALLS:
                 truncated = True
                 break
 
@@ -1233,57 +1507,129 @@ async def get_smart_insights_report(*, timeline: TimelineKey) -> dict[str, Any]:
     if has_more:
         truncated = True
 
-    missing_field_rates, data_coverage_percent = _build_missing_field_rates(records)
+    available_calls = len(candidate_conversations)
+    selected_conversations = _sort_by_recency(candidate_conversations)[:detail_fetch_cap]
+    capped_by_detail_cap = available_calls > len(selected_conversations)
+
+    if not selected_conversations:
+        return _empty_report(
+            timeline=timeline,
+            generated_at_iso=generated_at_iso,
+            data_coverage_percent=0.0,
+            available_calls=available_calls,
+            analyzed_calls=0,
+            detail_fetch_cap=detail_fetch_cap,
+            capped_by_detail_cap=capped_by_detail_cap,
+            detail_fetch_failures=0,
+        )
+
+    records, detail_fetch_failures = await _build_detail_records(
+        selected_conversations,
+        concurrency=detail_fetch_concurrency,
+    )
+    analyzed_calls = len(records)
 
     if not records:
         return _empty_report(
             timeline=timeline,
             generated_at_iso=generated_at_iso,
-            missing_field_rates=missing_field_rates,
-            data_coverage_percent=data_coverage_percent,
-        ).model_dump()
+            data_coverage_percent=0.0,
+            available_calls=available_calls,
+            analyzed_calls=analyzed_calls,
+            detail_fetch_cap=detail_fetch_cap,
+            capped_by_detail_cap=capped_by_detail_cap,
+            detail_fetch_failures=detail_fetch_failures,
+        )
 
-    criteria_stats = _criteria_rates(records)
-    locked_metrics = _build_locked_metrics(records, criteria_stats)
-    segments = _build_segments(records)
-    action_candidates = _build_action_candidates(records, len(records))
+    missing_field_rates, data_coverage_percent = _build_missing_field_rates(records)
+    criteria_counts = _criteria_state_counts(records)
+    criteria_unknown_rates: dict[CriterionKey, float] = {
+        key: _percent(criteria_counts[key]["unknown"], len(records)) for key in CRITERIA_KEYS
+    }
+    resolution_stats = _resolution_stats(records)
+
+    knowledge_gap_candidates = _build_knowledge_gap_candidates(records, len(records))
+    failure_type_candidates = _build_failure_type_candidates(records, len(records))
+    action_candidates = _build_priority_action_candidates(records, len(records))
 
     caveats = _build_data_quality_caveats(
         total_calls=len(records),
         data_coverage_percent=data_coverage_percent,
-        criteria_unknown_rates=criteria_stats["unknownRates"],
+        criteria_unknown_rates=criteria_unknown_rates,
+        missing_field_rates=missing_field_rates,
         truncated=truncated,
+        capped_by_detail_cap=capped_by_detail_cap,
+        detail_fetch_failures=detail_fetch_failures,
+    )
+
+    top_failure_label = (
+        str(failure_type_candidates[0]["failureTypeLabel"]) if failure_type_candidates else "No dominant failure type"
+    )
+    top_action_title = str(action_candidates[0]["actionTitle"]) if action_candidates else "Unknown"
+
+    overview = _deterministic_overview(
+        total_calls=len(records),
+        resolution_rate_percent=float(resolution_stats["resolutionRatePercent"]),
+        unresolved_calls=int(resolution_stats["unresolvedCalls"]),
+        top_failure_label=top_failure_label,
+        top_action_title=top_action_title,
     )
 
     report_input = _build_report_input(
         timeline=timeline,
         generated_at_iso=generated_at_iso,
         total_calls=len(records),
+        available_calls=available_calls,
+        analyzed_calls=analyzed_calls,
+        detail_fetch_cap=detail_fetch_cap,
+        capped_by_detail_cap=capped_by_detail_cap,
+        detail_fetch_failures=detail_fetch_failures,
         data_coverage_percent=data_coverage_percent,
-        locked_metrics=locked_metrics,
-        segments=segments,
+        resolution_rate_percent=float(resolution_stats["resolutionRatePercent"]),
+        unresolved_calls=int(resolution_stats["unresolvedCalls"]),
+        knowledge_gap_candidates=knowledge_gap_candidates,
+        failure_type_candidates=failure_type_candidates,
         action_candidates=action_candidates,
+        caveats=caveats,
     )
 
     try:
         llm_report = await _generate_llm_report(report_input)
-    except (OpenAIApiError, ValidationError) as exc:
-        raise SmartInsightsGenerationError("Failed to generate structured Smart Insights report.") from exc
+    except (OpenAIApiError, ValidationError):
+        return _build_fallback_report(
+            timeline=timeline,
+            generated_at_iso=generated_at_iso,
+            total_calls=len(records),
+            available_calls=available_calls,
+            analyzed_calls=analyzed_calls,
+            detail_fetch_cap=detail_fetch_cap,
+            capped_by_detail_cap=capped_by_detail_cap,
+            detail_fetch_failures=detail_fetch_failures,
+            data_coverage_percent=data_coverage_percent,
+            overview=overview,
+            knowledge_gap_candidates=knowledge_gap_candidates,
+            failure_type_candidates=failure_type_candidates,
+            action_candidates=action_candidates,
+            caveats=caveats,
+        )
 
     try:
-        finalized_report = _enforce_locked_fields(
+        return _enforce_locked_fields(
             report=llm_report,
             timeline=timeline,
             generated_at_iso=generated_at_iso,
             total_calls=len(records),
+            available_calls=available_calls,
+            analyzed_calls=analyzed_calls,
+            detail_fetch_cap=detail_fetch_cap,
+            capped_by_detail_cap=capped_by_detail_cap,
+            detail_fetch_failures=detail_fetch_failures,
             data_coverage_percent=data_coverage_percent,
-            locked_metrics=locked_metrics,
-            missing_field_rates=missing_field_rates,
-            caveats=caveats,
-            segments=segments,
+            overview=overview,
+            knowledge_gap_candidates=knowledge_gap_candidates,
+            failure_type_candidates=failure_type_candidates,
             action_candidates=action_candidates,
+            caveats=caveats,
         )
     except ValidationError as exc:
         raise SmartInsightsGenerationError("Failed to normalize Smart Insights report output.") from exc
-
-    return finalized_report.model_dump()

@@ -46,5 +46,6 @@ Use the combined dev stack script:
 - Home landing page with redesigned action cards.
 - Monitoring page with scrollable conversation list and load-more pagination.
 - Backend endpoint `GET /api/monitoring/conversations` for the configured customer agent.
-- Backend endpoint `GET /api/smart-insights/report?timeline=1d|7d|1m` with OpenAI structured report generation.
+- Backend endpoint `GET /api/smart-insights/report?timeline=1d|7d|1m` with detail-level ElevenLabs analysis extraction, bounded detail cap, and OpenAI structured report generation.
+- Smart Insights UI rendered as a single-sheet plain-language report for support agents (executive summary, top opportunity, knowledge-gap insights, failure types, priority action queue, and caveats).
 - Centralized styling in `frontend/src/styles/theme.css`.

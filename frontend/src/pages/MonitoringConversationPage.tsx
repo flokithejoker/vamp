@@ -122,6 +122,118 @@ function serializePayload(value: unknown): string {
   }
 }
 
+function readStatusFromToolPayload(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return null;
+  }
+
+  for (const path of ['status', 'result.status', 'output.status']) {
+    const rawStatus = readPath(payload, path);
+    if (typeof rawStatus === 'string' && rawStatus.trim()) {
+      return rawStatus.trim();
+    }
+    if (typeof rawStatus === 'number' || typeof rawStatus === 'boolean') {
+      return String(rawStatus);
+    }
+  }
+
+  return null;
+}
+
+function formatToolEventLabel(toolEvent: MonitoringToolEvent): string {
+  if (toolEvent.kind === 'call') {
+    return `Call: ${toolEvent.name}`;
+  }
+
+  const status = readStatusFromToolPayload(toolEvent.payload) ?? '-';
+  return `Result: ${status}`;
+}
+
+function getDisplayMessage(turn: MonitoringTranscriptTurn): string | null {
+  const message = turn.message.trim();
+  if (!message || message === '-') {
+    return null;
+  }
+  return turn.message;
+}
+
+function hasAnyIntersection(left: Set<string>, right: Set<string>): boolean {
+  for (const value of left) {
+    if (right.has(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function shouldMergeToolOnlyTurns(previousTurn: MonitoringTranscriptTurn, nextTurn: MonitoringTranscriptTurn): boolean {
+  if (getDisplayMessage(previousTurn) || getDisplayMessage(nextTurn)) {
+    return false;
+  }
+  if (previousTurn.toolEvents.length === 0 || nextTurn.toolEvents.length === 0) {
+    return false;
+  }
+
+  const previousCallIds = new Set(
+    previousTurn.toolEvents.filter((event) => event.kind === 'call').map((event) => event.id.trim()).filter(Boolean)
+  );
+  const nextCallIds = new Set(
+    nextTurn.toolEvents.filter((event) => event.kind === 'call').map((event) => event.id.trim()).filter(Boolean)
+  );
+  const previousResultIds = new Set(
+    previousTurn.toolEvents.filter((event) => event.kind === 'result').map((event) => event.id.trim()).filter(Boolean)
+  );
+  const nextResultIds = new Set(
+    nextTurn.toolEvents.filter((event) => event.kind === 'result').map((event) => event.id.trim()).filter(Boolean)
+  );
+
+  if (hasAnyIntersection(previousCallIds, nextResultIds) || hasAnyIntersection(previousResultIds, nextCallIds)) {
+    return true;
+  }
+
+  const previousNames = new Set(previousTurn.toolEvents.map((event) => event.name.trim().toLowerCase()).filter(Boolean));
+  const nextNames = new Set(nextTurn.toolEvents.map((event) => event.name.trim().toLowerCase()).filter(Boolean));
+  const hasCallAcrossTurns =
+    previousTurn.toolEvents.some((event) => event.kind === 'call') || nextTurn.toolEvents.some((event) => event.kind === 'call');
+  const hasResultAcrossTurns =
+    previousTurn.toolEvents.some((event) => event.kind === 'result') ||
+    nextTurn.toolEvents.some((event) => event.kind === 'result');
+
+  return hasCallAcrossTurns && hasResultAcrossTurns && hasAnyIntersection(previousNames, nextNames);
+}
+
+function mergeToolOnlyTurns(turns: MonitoringTranscriptTurn[]): MonitoringTranscriptTurn[] {
+  const merged: MonitoringTranscriptTurn[] = [];
+
+  for (const turn of turns) {
+    const previousTurn = merged.length > 0 ? merged[merged.length - 1] : null;
+    if (!previousTurn || !shouldMergeToolOnlyTurns(previousTurn, turn)) {
+      merged.push(turn);
+      continue;
+    }
+
+    const mergedEventMap = new Map<string, MonitoringToolEvent>();
+    for (const event of [...previousTurn.toolEvents, ...turn.toolEvents]) {
+      const mergedEventKey = `${event.kind}:${event.id}:${event.name}`;
+      if (!mergedEventMap.has(mergedEventKey)) {
+        mergedEventMap.set(mergedEventKey, event);
+      }
+    }
+
+    merged[merged.length - 1] = {
+      ...previousTurn,
+      id: `${previousTurn.id}__${turn.id}`,
+      role: previousTurn.role === turn.role ? previousTurn.role : 'tool',
+      timeInCallSeconds:
+        previousTurn.timeInCallSeconds !== null ? previousTurn.timeInCallSeconds : turn.timeInCallSeconds,
+      timeLabel: previousTurn.timeInCallSeconds !== null ? previousTurn.timeLabel : turn.timeLabel,
+      toolEvents: Array.from(mergedEventMap.values()),
+    };
+  }
+
+  return merged;
+}
+
 export function MonitoringConversationPage() {
   const { conversationId } = useParams();
   const location = useLocation();
@@ -225,6 +337,7 @@ export function MonitoringConversationPage() {
   }
 
   const detailsToggleLabel = isDetailsOpen ? 'Hide details' : 'Show details';
+  const displayTranscript = useMemo(() => mergeToolOnlyTurns(item?.transcript ?? []), [item?.transcript]);
 
   return (
     <section className="page-shell monitoring-conversation-page">
@@ -297,56 +410,60 @@ export function MonitoringConversationPage() {
 
           <div className={`monitoring-conversation-main ${isDetailsOpen ? 'is-details-open' : 'is-details-collapsed'}`}>
             <div className="page-surface monitoring-transcript-surface">
-              {item.transcript.length === 0 ? (
+              {displayTranscript.length === 0 ? (
                 <p className="monitoring-state">No transcript is available for this conversation yet.</p>
               ) : (
                 <ul className="monitoring-transcript-list" aria-label="Conversation transcript">
-                  {item.transcript.map((turn) => (
-                    <li key={turn.id} className={`monitoring-turn monitoring-turn-${turn.role}`}>
-                      <div className="monitoring-turn-bubble">
-                        <div className="monitoring-turn-meta">
-                          <span>{formatRoleLabel(turn.role)}</span>
-                          <span>{turn.timeLabel}</span>
-                        </div>
-                        <p className="monitoring-turn-message">{turn.message}</p>
+                  {displayTranscript.map((turn) => {
+                    const displayMessage = getDisplayMessage(turn);
 
-                        {turn.toolEvents.length > 0 ? (
-                          <div className="monitoring-tool-section">
-                            <div className="monitoring-tool-badges">
-                              {turn.toolEvents.map((toolEvent) => {
-                                const toolKey = `${turn.id}:${toolEvent.id}`;
-                                const isExpanded = Boolean(expandedToolKeys[toolKey]);
+                    return (
+                      <li key={turn.id} className={`monitoring-turn monitoring-turn-${turn.role}`}>
+                        <div className="monitoring-turn-bubble">
+                          <div className="monitoring-turn-meta">
+                            <span>{formatRoleLabel(turn.role)}</span>
+                            <span>{turn.timeLabel}</span>
+                          </div>
+                          {displayMessage ? <p className="monitoring-turn-message">{displayMessage}</p> : null}
+
+                          {turn.toolEvents.length > 0 ? (
+                            <div className="monitoring-tool-section">
+                              <div className="monitoring-tool-badges">
+                                {turn.toolEvents.map((toolEvent, eventIndex) => {
+                                  const toolKey = `${turn.id}:${toolEvent.kind}:${toolEvent.id}:${eventIndex}`;
+                                  const isExpanded = Boolean(expandedToolKeys[toolKey]);
+
+                                  return (
+                                    <button
+                                      type="button"
+                                      key={toolKey}
+                                      className={`monitoring-tool-badge ${isExpanded ? 'is-active' : ''}`}
+                                      onClick={() => toggleToolPayload(toolKey)}
+                                    >
+                                      {formatToolEventLabel(toolEvent)}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+
+                              {turn.toolEvents.map((toolEvent, eventIndex) => {
+                                const toolKey = `${turn.id}:${toolEvent.kind}:${toolEvent.id}:${eventIndex}`;
+                                if (!expandedToolKeys[toolKey]) {
+                                  return null;
+                                }
 
                                 return (
-                                  <button
-                                    type="button"
-                                    key={toolKey}
-                                    className={`monitoring-tool-badge ${isExpanded ? 'is-active' : ''}`}
-                                    onClick={() => toggleToolPayload(toolKey)}
-                                  >
-                                    {toolEvent.kind === 'call' ? 'Call' : 'Result'}: {toolEvent.name}
-                                  </button>
+                                  <pre key={`${toolKey}-payload`} className="monitoring-tool-payload">
+                                    {serializePayload(toolEvent.payload)}
+                                  </pre>
                                 );
                               })}
                             </div>
-
-                            {turn.toolEvents.map((toolEvent) => {
-                              const toolKey = `${turn.id}:${toolEvent.id}`;
-                              if (!expandedToolKeys[toolKey]) {
-                                return null;
-                              }
-
-                              return (
-                                <pre key={`${toolKey}-payload`} className="monitoring-tool-payload">
-                                  {serializePayload(toolEvent.payload)}
-                                </pre>
-                              );
-                            })}
-                          </div>
-                        ) : null}
-                      </div>
-                    </li>
-                  ))}
+                          ) : null}
+                        </div>
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
             </div>

@@ -417,6 +417,14 @@ def _build_tool_event(
     if payload is None:
         payload = raw
 
+    if kind == "result":
+        raw_status = _pick_raw_value(raw, ["status", "result.status", "output.status"])
+        if raw_status is not None:
+            if isinstance(payload, dict):
+                payload = {"status": payload.get("status", raw_status), **payload}
+            else:
+                payload = {"status": raw_status, "payload": payload}
+
     return {
         "id": event_id,
         "kind": kind,
@@ -590,10 +598,7 @@ def _extract_transcript(conversation: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _aggregate_tools_used(conversation: dict[str, Any], transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
     counts: dict[str, int] = {}
-
-    for name in _pick_string_list(conversation, ["tool_names", "toolNames", "metadata.tool_names", "metadata.toolNames"]):
-        clean_name = _safe_tool_name(name)
-        counts[clean_name] = counts.get(clean_name, 0) + 1
+    has_call_events = False
 
     for turn in transcript:
         tool_events = turn.get("toolEvents")
@@ -602,7 +607,18 @@ def _aggregate_tools_used(conversation: dict[str, Any], transcript: list[dict[st
         for event in tool_events:
             if not isinstance(event, dict):
                 continue
+            if _pick_string(event, ["kind"]) != "call":
+                continue
+            has_call_events = True
             clean_name = _safe_tool_name(_pick_string(event, ["name"]))
+            counts[clean_name] = counts.get(clean_name, 0) + 1
+
+    if not has_call_events:
+        for name in _pick_string_list(
+            conversation,
+            ["tool_names", "toolNames", "metadata.tool_names", "metadata.toolNames"],
+        ):
+            clean_name = _safe_tool_name(name)
             counts[clean_name] = counts.get(clean_name, 0) + 1
 
     return [

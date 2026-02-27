@@ -23,6 +23,23 @@ Required keys:
 Optional:
 
 - `OPENAI_MODEL` (defaults to `gpt-4.1-mini`)
+- `SMART_INSIGHTS_DETAIL_CAP` (defaults to `200`)
+- `SMART_INSIGHTS_DETAIL_FETCH_CONCURRENCY` (defaults to `8`)
+
+Smart Insights retrieval now uses conversation list pagination to find the window, then fetches per-conversation details
+for analyzed calls (details contain `analysis.data_collection_results` and `analysis.evaluation_criteria_results`).
+If detail fetch fails for a conversation, the endpoint falls back to summary payload for that record and reports a caveat.
+
+Smart Insights V2 response shape is designed for non-technical support agents:
+
+- `meta`
+- `overview` (executive summary + top opportunity)
+- `knowledgeGapInsights` (top 3 patterns with gap, friction, and internal action)
+- `failureTypeInsights` (top 3 failure types with plain-language why)
+- `priorityActionQueue` (top 3 with what/why/next step/escalation trigger)
+- `caveats` (bullet points only)
+
+Weighted criteria framing is removed from report output and ranking.
 
 Set the customer agent id in:
 
