@@ -1,6 +1,5 @@
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { AppLayout } from './layout/AppLayout';
-import { AgentSettingsPage } from './pages/AgentSettingsPage';
 import { FeedbackPage } from './pages/FeedbackPage';
 import { HomePage } from './pages/HomePage';
 import { MonitoringConversationPage } from './pages/MonitoringConversationPage';
@@ -13,7 +12,6 @@ export default function App() {
     <Routes>
       <Route element={<AppLayout />}>
         <Route path="/" element={<HomePage />} />
-        <Route path="/agent-settings" element={<AgentSettingsPage />} />
         <Route path="/monitoring" element={<MonitoringPage />} />
         <Route path="/monitoring/:conversationId" element={<MonitoringConversationPage />} />
         <Route path="/statistics" element={<StatisticsPage />} />

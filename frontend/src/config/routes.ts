@@ -48,12 +48,4 @@ export const appRoutes: AppRoute[] = [
     inHomeGrid: true,
     icon: 'feedback',
   },
-  {
-    id: 'agentSettings',
-    label: 'Agent Settings',
-    path: '/agent-settings',
-    homeSummary: 'Adjust Viktoria behavior, tone, and response settings.',
-    inHomeGrid: true,
-    icon: 'settings',
-  },
 ];

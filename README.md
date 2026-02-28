@@ -6,7 +6,7 @@ Frontend-first monorepo for the Viktoria control center, now including Monitorin
 
 - `frontend/` - React + Vite + TypeScript app with sidebar, redesigned home, and Monitoring V1 list UI.
 - `backend/` - Python FastAPI backend that proxies ElevenLabs conversations for Monitoring V1.
-- `database/` - Placeholder for future Prisma/PostgreSQL implementation.
+- `database/` - Local SQLite storage (currently used for call feedback data).
 
 ## Run Frontend
 
@@ -45,7 +45,33 @@ Use the combined dev stack script:
 - Sidebar navigation for all required pages.
 - Home landing page with redesigned action cards.
 - Monitoring page with scrollable conversation list and load-more pagination.
+- Feedback page with persisted call ratings/comments linked to conversations.
 - Backend endpoint `GET /api/monitoring/conversations` for the configured customer agent.
+- Backend endpoints for feedback ingestion:
+  - `POST /api/feedback/submit_call_rating`
+  - `POST /api/feedback/submit_call_feedback`
 - Backend endpoint `GET /api/smart-insights/report?timeline=1d|7d|1m` with detail-level ElevenLabs analysis extraction, bounded detail cap, and OpenAI structured report generation.
 - Smart Insights UI rendered as a single-sheet plain-language report for support agents (executive summary, top opportunity, knowledge-gap insights, failure types, priority action queue, and caveats).
 - Centralized styling in `frontend/src/styles/theme.css`.
+
+## Feedback Tool Wiring (Local Test)
+
+1. Start backend and frontend:
+
+```bash
+./scripts/dev-stack.sh start
+```
+
+2. Start ngrok tunnel for backend:
+
+```bash
+./scripts/start-ngrok.sh
+```
+
+3. In ElevenLabs, configure tools with your ngrok base URL:
+
+- `submit_call_rating` -> `POST <NGROK_URL>/api/feedback/submit_call_rating`
+- `submit_call_feedback` -> `POST <NGROK_URL>/api/feedback/submit_call_feedback`
+- `call_id` must be `{{system__conversation_id}}`
+
+This local test setup intentionally uses no authentication on feedback endpoints.

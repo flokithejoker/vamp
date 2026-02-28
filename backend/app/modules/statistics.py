@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from app.config.customer_agent import CUSTOMER_AGENT_CONFIG
 from app.providers.elevenlabs import list_agent_conversations
+from app.storage.feedback_store import get_ratings_for_call_ids
 
 TimelineKey = Literal["1h", "1d", "7d", "1m", "total"]
 
@@ -407,6 +408,7 @@ async def get_statistics_overview(*, timeline: TimelineKey, currency: str) -> di
 
         for conversation in payload.conversations:
             start_time_unix = _extract_start_time_unix(conversation)
+            conversation_id = _pick_string(conversation, ["conversation_id", "conversationId", "id"])
 
             if window.start_time_unix is not None:
                 if start_time_unix is None:
@@ -417,9 +419,9 @@ async def get_statistics_overview(*, timeline: TimelineKey, currency: str) -> di
             cost_amount, cost_currency = _pick_cost_fields(conversation)
             records.append(
                 {
+                    "conversationId": conversation_id,
                     "startTimeUnix": start_time_unix,
                     "durationSeconds": _extract_duration_seconds(conversation),
-                    "rating": _extract_rating(conversation),
                     "success": _extract_success(conversation),
                     "costAmount": cost_amount,
                     "costCurrency": cost_currency.upper() if isinstance(cost_currency, str) else None,
@@ -473,11 +475,22 @@ async def get_statistics_overview(*, timeline: TimelineKey, currency: str) -> di
         else None
     )
 
-    rating_values = [
-        rating
-        for rating in (record.get("rating") for record in records)
-        if isinstance(rating, (int, float)) and math.isfinite(float(rating))
-    ]
+    ratings_by_call_id = get_ratings_for_call_ids(
+        [
+            conversation_id
+            for conversation_id in (record.get("conversationId") for record in records)
+            if isinstance(conversation_id, str)
+        ]
+    )
+    rating_values: list[float] = []
+    for record in records:
+        conversation_id = record.get("conversationId")
+        if not isinstance(conversation_id, str):
+            continue
+        rating = ratings_by_call_id.get(conversation_id)
+        if isinstance(rating, int) and 1 <= rating <= 5:
+            rating_values.append(float(rating))
+
     rated_calls = len(rating_values)
     average_rating = (sum(rating_values) / rated_calls) if rated_calls > 0 else None
 

@@ -10,6 +10,9 @@ const TIMELINE_OPTIONS: Array<{ key: TimelineKey; label: string }> = [
   { key: '7d', label: '7d' },
   { key: '1m', label: '1m' },
 ];
+const SUPPORT_BOOKING_URL = (import.meta.env.VITE_SUPPORT_BOOKING_URL as string | undefined)?.trim() ?? '';
+const SMART_INSIGHTS_CACHE_STORAGE_KEY = 'smart_insights_report_cache_v2';
+const SMART_INSIGHTS_TIMELINE_STORAGE_KEY = 'smart_insights_selected_timeline_v2';
 
 type SmartInsightsReportResponse = {
   meta: {
@@ -64,6 +67,63 @@ type SmartInsightsReportResponse = {
   caveats: string[];
 };
 
+type SmartInsightsReportCache = Partial<Record<TimelineKey, SmartInsightsReportResponse>>;
+
+function isTimelineKey(value: string): value is TimelineKey {
+  return value === '1d' || value === '7d' || value === '1m';
+}
+
+function readStoredTimeline(): TimelineKey {
+  if (typeof window === 'undefined') {
+    return DEFAULT_TIMELINE;
+  }
+  const rawValue = window.localStorage.getItem(SMART_INSIGHTS_TIMELINE_STORAGE_KEY);
+  if (rawValue && isTimelineKey(rawValue)) {
+    return rawValue;
+  }
+  return DEFAULT_TIMELINE;
+}
+
+function writeStoredTimeline(timeline: TimelineKey) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.localStorage.setItem(SMART_INSIGHTS_TIMELINE_STORAGE_KEY, timeline);
+}
+
+function readStoredReportCache(): SmartInsightsReportCache {
+  if (typeof window === 'undefined') {
+    return {};
+  }
+  const rawValue = window.localStorage.getItem(SMART_INSIGHTS_CACHE_STORAGE_KEY);
+  if (!rawValue) {
+    return {};
+  }
+  try {
+    const parsedValue = JSON.parse(rawValue) as SmartInsightsReportCache | null;
+    if (!parsedValue || typeof parsedValue !== 'object') {
+      return {};
+    }
+    const cache: SmartInsightsReportCache = {};
+    TIMELINE_OPTIONS.forEach((option) => {
+      const report = parsedValue[option.key];
+      if (report && typeof report === 'object' && report.meta?.timeline === option.key) {
+        cache[option.key] = report;
+      }
+    });
+    return cache;
+  } catch {
+    return {};
+  }
+}
+
+function writeStoredReportCache(cache: SmartInsightsReportCache) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.localStorage.setItem(SMART_INSIGHTS_CACHE_STORAGE_KEY, JSON.stringify(cache));
+}
+
 function formatInteger(value: number): string {
   return new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(value);
 }
@@ -93,55 +153,138 @@ function formatStatus(value: OperationalStatus): string {
   return 'Stable';
 }
 
+function buildReportClipboardText(report: SmartInsightsReportResponse): string {
+  const lines: string[] = [];
+  lines.push('Smart Insights Report');
+  lines.push(`Timeline: ${report.meta.timeline}`);
+  lines.push(`Generated: ${formatDateTime(report.meta.generatedAtIso)}`);
+  lines.push(`Analyzed Calls: ${formatInteger(report.meta.analyzedCalls)} of ${formatInteger(report.meta.availableCalls)}`);
+  lines.push('');
+
+  lines.push('Executive Summary');
+  lines.push(report.overview.summary);
+  lines.push(`Top Opportunity: ${report.overview.topOpportunity}`);
+  lines.push('');
+
+  if (report.knowledgeGapInsights.length > 0) {
+    lines.push('Main Knowledge Gaps');
+    report.knowledgeGapInsights.slice(0, 3).forEach((item, index) => {
+      lines.push(
+        `${index + 1}. Gap: ${item.knowledgeGapLabel} | Friction: ${item.primaryFrictionPointLabel} | Recommended Action: ${item.recommendedInternalActionLabel}`
+      );
+      lines.push(`   ${item.conciseExplanation}`);
+      lines.push(`   Evidence: ${formatInteger(item.evidence.calls)} calls (${formatPercent(item.evidence.sharePercent)})`);
+    });
+    lines.push('');
+  }
+
+  if (report.failureTypeInsights.length > 0) {
+    lines.push('Most Common Failure Types');
+    report.failureTypeInsights.slice(0, 3).forEach((item, index) => {
+      lines.push(`${index + 1}. ${item.failureTypeLabel}`);
+      lines.push(`   Why: ${item.whyItHappens}`);
+      lines.push(`   Related friction: ${item.relatedFriction}`);
+      lines.push(`   Related knowledge gap: ${item.relatedKnowledgeGap}`);
+      lines.push(`   Evidence: ${formatInteger(item.evidence.calls)} calls (${formatPercent(item.evidence.sharePercent)})`);
+    });
+    lines.push('');
+  }
+
+  if (report.priorityActionQueue.length > 0) {
+    lines.push('Priority Action Queue');
+    report.priorityActionQueue.slice(0, 3).forEach((action, index) => {
+      lines.push(`${index + 1}. ${action.actionTitle}`);
+      lines.push(`   Why now: ${action.whyNow}`);
+      lines.push(`   Agent next step: ${action.agentNextStep}`);
+      lines.push(`   Escalation trigger: ${action.escalationTrigger}`);
+      lines.push(`   Applies to: ${action.appliesTo}`);
+      lines.push(`   Evidence: ${formatInteger(action.evidence.calls)} calls (${formatPercent(action.evidence.sharePercent)})`);
+    });
+    lines.push('');
+  }
+
+  if (report.caveats.length > 0) {
+    lines.push('Caveats');
+    report.caveats.forEach((caveat) => {
+      lines.push(`- ${caveat}`);
+    });
+  }
+
+  return lines.join('\n').trim();
+}
+
 export function SmartInsightsPage() {
-  const [selectedTimeline, setSelectedTimeline] = useState<TimelineKey>(DEFAULT_TIMELINE);
-  const [data, setData] = useState<SmartInsightsReportResponse | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+  const [selectedTimeline, setSelectedTimeline] = useState<TimelineKey>(() => readStoredTimeline());
+  const [reportCache, setReportCache] = useState<SmartInsightsReportCache>(() => readStoredReportCache());
+  const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [reloadTick, setReloadTick] = useState(0);
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle');
+  const data = reportCache[selectedTimeline] ?? null;
 
   useEffect(() => {
-    const controller = new AbortController();
-    let cancelled = false;
+    writeStoredTimeline(selectedTimeline);
+    setError(null);
+    setCopyState('idle');
+  }, [selectedTimeline]);
 
-    async function loadReport() {
-      setIsLoading(true);
-      setError(null);
-
-      try {
-        const response = await fetchJsonWithRetry<SmartInsightsReportResponse>(
-          `/api/smart-insights/report?timeline=${selectedTimeline}`,
-          { signal: controller.signal }
-        );
-        if (cancelled) {
-          return;
-        }
-        setData(response);
-      } catch (requestError) {
-        if (cancelled) {
-          return;
-        }
-        const message = requestError instanceof Error ? requestError.message : 'Unknown request error.';
-        setError(message);
-        setData(null);
-      } finally {
-        if (!cancelled) {
-          setIsLoading(false);
-        }
-      }
+  useEffect(() => {
+    if (copyState === 'idle') {
+      return;
     }
+    const timer = window.setTimeout(() => {
+      setCopyState('idle');
+    }, 2200);
+    return () => window.clearTimeout(timer);
+  }, [copyState]);
 
-    void loadReport();
-
-    return () => {
-      cancelled = true;
-      controller.abort();
-    };
-  }, [selectedTimeline, reloadTick]);
-
-  function refreshReport() {
-    setReloadTick((previous) => previous + 1);
+  async function generateReport() {
+    const timeline = selectedTimeline;
+    setIsLoading(true);
+    setError(null);
+    try {
+      const response = await fetchJsonWithRetry<SmartInsightsReportResponse>(
+        `/api/smart-insights/report?timeline=${timeline}`
+      );
+      setReportCache((previousCache) => {
+        const nextCache: SmartInsightsReportCache = {
+          ...previousCache,
+          [timeline]: response,
+        };
+        writeStoredReportCache(nextCache);
+        return nextCache;
+      });
+    } catch (requestError) {
+      const message = requestError instanceof Error ? requestError.message : 'Unknown request error.';
+      setError(message);
+    } finally {
+      setIsLoading(false);
+    }
   }
+
+  function openSupportBooking() {
+    if (!SUPPORT_BOOKING_URL) {
+      return;
+    }
+    window.open(SUPPORT_BOOKING_URL, '_blank', 'noopener,noreferrer');
+  }
+
+  async function copyReportToClipboard() {
+    if (!data || !navigator.clipboard) {
+      setCopyState('error');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(buildReportClipboardText(data));
+      setCopyState('copied');
+    } catch {
+      setCopyState('error');
+    }
+  }
+
+  const copyButtonLabel = copyState === 'copied' ? 'Copied' : copyState === 'error' ? 'Copy Failed' : 'Copy Report';
+  const copyButtonTitle = !data || isLoading ? 'Load a report to copy it' : copyButtonLabel;
+  const refreshButtonTitle = !data ? 'Create a report first' : isLoading ? 'Generating report...' : 'Refresh Report';
+  const createButtonTitle = isLoading ? 'Creating report...' : 'Create Report';
 
   return (
     <section className="page-shell smart-insights-page">
@@ -157,27 +300,77 @@ export function SmartInsightsPage() {
               </p>
             ) : null}
           </div>
-          <div className="stats-timeline-group" role="tablist" aria-label="Smart Insights timeline">
-            {TIMELINE_OPTIONS.map((option) => (
-              <button
-                key={option.key}
-                type="button"
-                className={`stats-timeline-button ${selectedTimeline === option.key ? 'is-active' : ''}`}
-                onClick={() => setSelectedTimeline(option.key)}
-              >
-                {option.label}
-              </button>
-            ))}
+          <div className="smart-header-controls">
+            <div className="stats-timeline-group" role="tablist" aria-label="Smart Insights timeline">
+              {TIMELINE_OPTIONS.map((option) => (
+                <button
+                  key={option.key}
+                  type="button"
+                  className={`stats-timeline-button ${selectedTimeline === option.key ? 'is-active' : ''}`}
+                  onClick={() => setSelectedTimeline(option.key)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              className={`icon-button smart-copy-report-button ${copyState === 'copied' ? 'is-copied' : ''} ${
+                copyState === 'error' ? 'is-error' : ''
+              }`}
+              onClick={copyReportToClipboard}
+              disabled={!data || isLoading}
+              title={copyButtonTitle}
+              aria-label={copyButtonTitle}
+            >
+              <svg viewBox="0 0 24 24" className="icon-16" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <rect x="9" y="9" width="13" height="13" rx="2" />
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              className={`icon-button smart-refresh-report-button ${isLoading ? 'is-loading' : ''}`}
+              onClick={() => void generateReport()}
+              disabled={!data || isLoading}
+              title={refreshButtonTitle}
+              aria-label={refreshButtonTitle}
+            >
+              <svg viewBox="0 0 24 24" className="icon-16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M3 12a9 9 0 0 1 15.2-6.4" />
+                <path d="M19 3v4h-4" />
+                <path d="M21 12a9 9 0 0 1-15.2 6.4" />
+                <path d="M5 21v-4h4" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              className="btn-primary smart-book-support-button"
+              onClick={openSupportBooking}
+              disabled={!SUPPORT_BOOKING_URL}
+              title={!SUPPORT_BOOKING_URL ? 'Set VITE_SUPPORT_BOOKING_URL in frontend/.env' : undefined}
+            >
+              Book Support
+            </button>
           </div>
         </div>
       </div>
 
-      {isLoading ? <p className="monitoring-state">Loading smart insights...</p> : null}
+      {!data ? (
+        <div className="page-surface smart-create-state">
+          {error ? <p className="smart-create-error">{error}</p> : null}
+          <button type="button" className="btn-primary smart-create-button" onClick={() => void generateReport()} disabled={isLoading}>
+            {createButtonTitle}
+          </button>
+        </div>
+      ) : null}
 
-      {!isLoading && error ? (
+      {isLoading && data ? <p className="monitoring-state">Generating updated smart insights...</p> : null}
+
+      {data && error ? (
         <div className="monitoring-state monitoring-state-error">
           <p>{error}</p>
-          <button type="button" className="btn-secondary monitoring-error-retry" onClick={refreshReport}>
+          <button type="button" className="btn-secondary monitoring-error-retry" onClick={() => void generateReport()} disabled={isLoading}>
             Retry
           </button>
         </div>

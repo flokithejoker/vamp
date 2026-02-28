@@ -10,6 +10,7 @@ from app.modules.monitoring import MonitoringConversationNotFoundError
 from app.modules.smart_insights import SmartInsightsGenerationError
 from app.providers.elevenlabs import BackendConfigurationError, ElevenLabsApiError
 from app.providers.openai import OpenAIApiError, OpenAIConfigurationError
+from app.routes.feedback import router as feedback_router
 from app.routes.monitoring import router as monitoring_router
 from app.routes.smart_insights import router as smart_insights_router
 from app.routes.statistics import router as statistics_router
@@ -22,10 +23,11 @@ app = FastAPI(title="Dormero Viktoria Backend", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
+app.include_router(feedback_router)
 app.include_router(monitoring_router)
 app.include_router(statistics_router)
 app.include_router(smart_insights_router)

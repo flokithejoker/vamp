@@ -13,6 +13,7 @@ from app.providers.elevenlabs import (
     get_conversation_details,
     list_agent_conversations,
 )
+from app.storage.feedback_store import get_call_feedback
 
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 50
@@ -699,6 +700,7 @@ async def get_monitoring_conversation_detail(*, conversation_id: str) -> dict[st
     conversation = await _fetch_conversation_for_agent(conversation_id)
     mapped = _map_conversation(conversation)
     transcript = _extract_transcript(conversation)
+    feedback = get_call_feedback(call_id=mapped["conversationId"])
 
     summary = _pick_string(
         conversation,
@@ -732,6 +734,7 @@ async def get_monitoring_conversation_detail(*, conversation_id: str) -> dict[st
         "hasResponseAudio": bool(has_response_audio),
         "transcript": transcript,
         "toolsUsed": _aggregate_tools_used(conversation, transcript),
+        "feedback": feedback,
     }
 
     return {

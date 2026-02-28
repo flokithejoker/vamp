@@ -24,6 +24,16 @@ type MonitoringToolUsed = {
   count: number;
 };
 
+type MonitoringCallFeedback = {
+  callId: string;
+  rating: number | null;
+  comment: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  ratingUpdatedAt: string | null;
+  commentUpdatedAt: string | null;
+};
+
 type MonitoringConversationDetailItem = {
   conversationId: string;
   title: string;
@@ -41,6 +51,7 @@ type MonitoringConversationDetailItem = {
   hasResponseAudio: boolean;
   transcript: MonitoringTranscriptTurn[];
   toolsUsed: MonitoringToolUsed[];
+  feedback: MonitoringCallFeedback | null;
 };
 
 type MonitoringConversationDetailResponse = {
@@ -50,6 +61,7 @@ type MonitoringConversationDetailResponse = {
 
 type ConversationLocationState = {
   conversationTitle?: string;
+  returnTo?: string;
 };
 
 function readPath(root: unknown, path: string): unknown {
@@ -120,6 +132,26 @@ function serializePayload(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function formatFeedbackTime(rawValue: string | null): string {
+  if (!rawValue) {
+    return '-';
+  }
+
+  const parsedDate = new Date(rawValue);
+  if (Number.isNaN(parsedDate.getTime())) {
+    return rawValue;
+  }
+
+  return new Intl.DateTimeFormat('de-DE', {
+    day: '2-digit',
+    month: '2-digit',
+    year: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(parsedDate);
 }
 
 function readStatusFromToolPayload(payload: unknown): string | null {
@@ -242,6 +274,11 @@ export function MonitoringConversationPage() {
     typeof locationState?.conversationTitle === 'string' && locationState.conversationTitle.trim()
       ? locationState.conversationTitle.trim()
       : null;
+  const backDestination =
+    typeof locationState?.returnTo === 'string' && locationState.returnTo.startsWith('/')
+      ? locationState.returnTo
+      : '/monitoring';
+  const backLabel = backDestination === '/feedback' ? 'Back to feedback' : 'Back to conversations';
 
   const [item, setItem] = useState<MonitoringConversationDetailItem | null>(null);
   const [raw, setRaw] = useState<Record<string, unknown> | null>(null);
@@ -346,10 +383,10 @@ export function MonitoringConversationPage() {
           <div className="monitoring-conversation-header-row">
             <div className="monitoring-conversation-title-group">
               <Link
-                to="/monitoring"
+                to={backDestination}
                 className="icon-button monitoring-back-icon"
-                aria-label="Back to conversations"
-                title="Back to conversations"
+                aria-label={backLabel}
+                title={backLabel}
               >
                 <svg viewBox="0 0 24 24" className="icon-16" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M15 18l-6-6 6-6" />
@@ -508,6 +545,25 @@ export function MonitoringConversationPage() {
                       ))}
                     </ul>
                   )}
+                </div>
+
+                <div className="monitoring-details-block">
+                  <h3>Customer Feedback</h3>
+                  <div className="monitoring-feedback-grid">
+                    <p className="monitoring-feedback-item">
+                      <span>Rating</span>
+                      <strong>
+                        {item.feedback?.rating !== null && item.feedback?.rating !== undefined
+                          ? `${item.feedback.rating}/5`
+                          : '-'}
+                      </strong>
+                    </p>
+                    <p className="monitoring-feedback-item">
+                      <span>Last Update</span>
+                      <strong>{formatFeedbackTime(item.feedback?.updatedAt ?? null)}</strong>
+                    </p>
+                  </div>
+                  <p className="monitoring-feedback-comment">{item.feedback?.comment?.trim() || '-'}</p>
                 </div>
 
                 <details className="monitoring-advanced-details">

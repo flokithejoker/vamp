@@ -25,6 +25,7 @@ Optional:
 - `OPENAI_MODEL` (defaults to `gpt-4.1-mini`)
 - `SMART_INSIGHTS_DETAIL_CAP` (defaults to `200`)
 - `SMART_INSIGHTS_DETAIL_FETCH_CONCURRENCY` (defaults to `8`)
+- `FEEDBACK_DB_PATH` (defaults to `<repo>/database/feedback.sqlite3`)
 
 Smart Insights retrieval now uses conversation list pagination to find the window, then fetches per-conversation details
 for analyzed calls (details contain `analysis.data_collection_results` and `analysis.evaluation_criteria_results`).
@@ -55,6 +56,35 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 API endpoints:
 
 - `GET /health`
+- `POST /api/feedback/submit_call_rating`
+- `POST /api/feedback/submit_call_feedback`
+- `GET /api/feedback/calls?limit=&offset=`
+- `GET /api/feedback/calls/{callId}`
 - `GET /api/monitoring/conversations?cursor=&pageSize=`
 - `GET /api/statistics/overview?timeline=1d&currency=USD`
 - `GET /api/smart-insights/report?timeline=7d`
+
+## Local Feedback Loop Setup
+
+For local testing, feedback submit endpoints are intentionally unauthenticated.
+
+1. Start backend:
+
+```bash
+cd /Users/peter/clar/backend
+source .venv/bin/activate
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+2. Start tunnel:
+
+```bash
+cd /Users/peter/clar
+./scripts/start-ngrok.sh
+```
+
+3. In ElevenLabs tool configuration, set:
+
+- `submit_call_rating` -> `POST <NGROK_URL>/api/feedback/submit_call_rating`
+- `submit_call_feedback` -> `POST <NGROK_URL>/api/feedback/submit_call_feedback`
+- `call_id` -> `{{system__conversation_id}}`

@@ -1,5 +1,9 @@
-# Database Placeholder
+# Database
 
-This folder is intentionally empty for now.
+This folder stores local database files used by the project.
 
-Prisma schema, migrations, and PostgreSQL setup will be added incrementally as features are implemented.
+Current usage:
+
+- `feedback.sqlite3` is created automatically by the backend when feedback endpoints are used.
+
+Future schema/migration tooling (Prisma/PostgreSQL) can still be added incrementally.
