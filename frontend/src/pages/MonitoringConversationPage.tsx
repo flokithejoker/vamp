@@ -563,7 +563,10 @@ export function MonitoringConversationPage() {
                       <strong>{formatFeedbackTime(item.feedback?.updatedAt ?? null)}</strong>
                     </p>
                   </div>
-                  <p className="monitoring-feedback-comment">{item.feedback?.comment?.trim() || '-'}</p>
+                  <div className="monitoring-feedback-comment-card">
+                    <span className="monitoring-feedback-comment-label">Comment</span>
+                    <p className="monitoring-feedback-comment">{item.feedback?.comment?.trim() || '-'}</p>
+                  </div>
                 </div>
 
                 <details className="monitoring-advanced-details">
