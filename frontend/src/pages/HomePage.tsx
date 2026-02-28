@@ -21,6 +21,8 @@ export function HomePage() {
           />
         ))}
       </div>
+
+      <img className="home-widget-image" src="/widget.png" alt="Widget" />
     </section>
   );
 }

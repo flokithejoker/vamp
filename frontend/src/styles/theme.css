@@ -279,6 +279,14 @@ a {
   color: var(--slate-900);
 }
 
+.home-widget-image {
+  display: block;
+  width: min(100%, 280px);
+  height: auto;
+  margin: 0 auto;
+  border-radius: var(--radius-2xl);
+}
+
 .page-placeholder {
   padding: 2rem;
 }
