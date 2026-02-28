@@ -284,9 +284,6 @@ export function StatisticsPage() {
                   : averageCostPerCallFootnote
               }
             />
-          </div>
-
-          <div className="stats-card-grid">
             <StatCard
               title="Average Duration"
               value={formatDuration(data.metrics.averageDurationSeconds)}
@@ -300,9 +297,6 @@ export function StatisticsPage() {
               value={formatInteger(data.metrics.totalCalls)}
               description="Number of conversations handled in this timeline."
             />
-          </div>
-
-          <div className="stats-card-grid">
             <StatCard
               title="Average Rating"
               value={formatRating(data.metrics.averageRating)}

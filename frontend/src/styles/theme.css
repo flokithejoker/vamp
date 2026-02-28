@@ -1164,18 +1164,20 @@ a {
 
 .stats-card-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  grid-auto-flow: column;
+  gap: 0.82rem;
 }
 
 .stats-card {
-  padding: 1rem 1.08rem;
+  padding: 0.82rem 0.92rem;
   border: 1px solid rgba(148, 163, 184, 0.32);
   background: #ffffff;
   display: flex;
   flex-direction: column;
-  gap: 0.32rem;
-  min-height: 145px;
+  gap: 0.24rem;
+  min-height: 124px;
 }
 
 .stats-card-title {
@@ -1861,6 +1863,8 @@ a {
 
   .stats-card-grid {
     grid-template-columns: 1fr;
+    grid-template-rows: none;
+    grid-auto-flow: row;
   }
 
   .stats-card {
